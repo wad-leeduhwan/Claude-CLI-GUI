@@ -55,13 +55,14 @@ if [ ! -d "${SOURCE}" ]; then
     echo "  $(du -h "${TMP_DIR}/app.zip" | cut -f1) 다운로드 완료"
 
     echo "[3/5] 압축 해제..."
-    ditto -x -k "${TMP_DIR}/app.zip" "${TMP_DIR}"
+    # ditto -c -k 로 만든 zip은 .app 내용물이 루트에 있으므로 .app 디렉토리로 직접 추출
+    SOURCE="${TMP_DIR}/${APP_BUNDLE}"
+    mkdir -p "${SOURCE}"
+    ditto -x -k "${TMP_DIR}/app.zip" "${SOURCE}"
 
-    # 압축 해제된 .app 찾기
-    SOURCE=$(find "${TMP_DIR}" -maxdepth 2 -name "*.app" -type d | head -1)
-    if [ -z "${SOURCE}" ] || [ ! -d "${SOURCE}" ]; then
+    if [ ! -d "${SOURCE}/Contents" ]; then
         rm -rf "${TMP_DIR}"
-        echo "ERROR: zip 안에서 .app 번들을 찾을 수 없습니다."
+        echo "ERROR: zip 구조가 올바르지 않습니다 (Contents 디렉토리 없음)."
         exit 1
     fi
 fi
