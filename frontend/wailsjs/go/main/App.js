@@ -10,12 +10,20 @@ export function AddNewTab() {
   return window['go']['main']['App']['AddNewTab']();
 }
 
+export function AnswerQuestion(arg1, arg2) {
+  return window['go']['main']['App']['AnswerQuestion'](arg1, arg2);
+}
+
 export function CancelMessage(arg1) {
   return window['go']['main']['App']['CancelMessage'](arg1);
 }
 
 export function CancelOrchestrationJob(arg1) {
   return window['go']['main']['App']['CancelOrchestrationJob'](arg1);
+}
+
+export function CheckForUpdate() {
+  return window['go']['main']['App']['CheckForUpdate']();
 }
 
 export function ClearConversation(arg1) {
@@ -26,12 +34,44 @@ export function CompletePath(arg1) {
   return window['go']['main']['App']['CompletePath'](arg1);
 }
 
+export function ConnectTeamsWorker(arg1, arg2) {
+  return window['go']['main']['App']['ConnectTeamsWorker'](arg1, arg2);
+}
+
 export function ConnectWorkerTab(arg1, arg2) {
   return window['go']['main']['App']['ConnectWorkerTab'](arg1, arg2);
 }
 
+export function CreateClaudeMd(arg1) {
+  return window['go']['main']['App']['CreateClaudeMd'](arg1);
+}
+
+export function DeleteFile(arg1) {
+  return window['go']['main']['App']['DeleteFile'](arg1);
+}
+
+export function DeleteSession(arg1, arg2) {
+  return window['go']['main']['App']['DeleteSession'](arg1, arg2);
+}
+
+export function DetectInstallMethod() {
+  return window['go']['main']['App']['DetectInstallMethod']();
+}
+
+export function DisconnectTeamsWorker(arg1, arg2) {
+  return window['go']['main']['App']['DisconnectTeamsWorker'](arg1, arg2);
+}
+
 export function DisconnectWorkerTab(arg1, arg2) {
   return window['go']['main']['App']['DisconnectWorkerTab'](arg1, arg2);
+}
+
+export function GetAgentModel() {
+  return window['go']['main']['App']['GetAgentModel']();
+}
+
+export function GetAppVersion() {
+  return window['go']['main']['App']['GetAppVersion']();
 }
 
 export function GetAutoContextFiles(arg1) {
@@ -40,6 +80,10 @@ export function GetAutoContextFiles(arg1) {
 
 export function GetAvailableModels() {
   return window['go']['main']['App']['GetAvailableModels']();
+}
+
+export function GetAvailableSessions(arg1) {
+  return window['go']['main']['App']['GetAvailableSessions'](arg1);
 }
 
 export function GetClaudeVersion() {
@@ -58,8 +102,20 @@ export function GetFileInfo(arg1) {
   return window['go']['main']['App']['GetFileInfo'](arg1);
 }
 
+export function GetPlanContent(arg1) {
+  return window['go']['main']['App']['GetPlanContent'](arg1);
+}
+
+export function GetReleaseNotes(arg1, arg2) {
+  return window['go']['main']['App']['GetReleaseNotes'](arg1, arg2);
+}
+
 export function GetSettings() {
   return window['go']['main']['App']['GetSettings']();
+}
+
+export function GetTabSessionID(arg1) {
+  return window['go']['main']['App']['GetTabSessionID'](arg1);
 }
 
 export function GetTabs() {
@@ -76,6 +132,10 @@ export function GetWebSocketPort() {
 
 export function IsGitRepo(arg1) {
   return window['go']['main']['App']['IsGitRepo'](arg1);
+}
+
+export function OpenChangelogPage() {
+  return window['go']['main']['App']['OpenChangelogPage']();
 }
 
 export function OpenExpandedView(arg1) {
@@ -98,8 +158,20 @@ export function RemoveTab(arg1) {
   return window['go']['main']['App']['RemoveTab'](arg1);
 }
 
+export function RenameFile(arg1, arg2) {
+  return window['go']['main']['App']['RenameFile'](arg1, arg2);
+}
+
 export function RenameTab(arg1, arg2) {
   return window['go']['main']['App']['RenameTab'](arg1, arg2);
+}
+
+export function RequestCodeReview(arg1) {
+  return window['go']['main']['App']['RequestCodeReview'](arg1);
+}
+
+export function RequestContextRecommendation(arg1) {
+  return window['go']['main']['App']['RequestContextRecommendation'](arg1);
 }
 
 export function SaveDroppedFile(arg1, arg2) {
@@ -108,6 +180,10 @@ export function SaveDroppedFile(arg1, arg2) {
 
 export function SaveDroppedImage(arg1, arg2) {
   return window['go']['main']['App']['SaveDroppedImage'](arg1, arg2);
+}
+
+export function SaveFileContent(arg1, arg2) {
+  return window['go']['main']['App']['SaveFileContent'](arg1, arg2);
 }
 
 export function SearchFiles(arg1, arg2) {
@@ -126,12 +202,24 @@ export function SendMessage(arg1, arg2, arg3) {
   return window['go']['main']['App']['SendMessage'](arg1, arg2, arg3);
 }
 
+export function SendTeamsMessage(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SendTeamsMessage'](arg1, arg2, arg3);
+}
+
+export function SetAgentModel(arg1) {
+  return window['go']['main']['App']['SetAgentModel'](arg1);
+}
+
 export function SetModel(arg1) {
   return window['go']['main']['App']['SetModel'](arg1);
 }
 
 export function SetWorkDir(arg1, arg2) {
   return window['go']['main']['App']['SetWorkDir'](arg1, arg2);
+}
+
+export function SwitchTabSession(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SwitchTabSession'](arg1, arg2, arg3);
 }
 
 export function ToggleTabAdminMode(arg1, arg2) {
@@ -142,8 +230,20 @@ export function ToggleTabPlanMode(arg1, arg2) {
   return window['go']['main']['App']['ToggleTabPlanMode'](arg1, arg2);
 }
 
+export function ToggleTabTeamsMode(arg1, arg2) {
+  return window['go']['main']['App']['ToggleTabTeamsMode'](arg1, arg2);
+}
+
+export function TranslateReleaseNotes() {
+  return window['go']['main']['App']['TranslateReleaseNotes']();
+}
+
 export function TruncateMessages(arg1, arg2) {
   return window['go']['main']['App']['TruncateMessages'](arg1, arg2);
+}
+
+export function UpdateClaude() {
+  return window['go']['main']['App']['UpdateClaude']();
 }
 
 export function UpdateSettings(arg1) {

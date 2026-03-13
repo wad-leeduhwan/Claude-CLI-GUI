@@ -11,7 +11,6 @@ import (
 	"regexp"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -35,18 +34,55 @@ func NewCLIWrapper() *CLIWrapper {
 	}
 }
 
+// AskUserQuestionData holds the parsed AskUserQuestion tool invocation
+type AskUserQuestionData struct {
+	ToolUseID string        `json:"toolUseId"`
+	Questions []AskQuestion `json:"questions"`
+}
+
+// AskQuestion represents a single question within AskUserQuestion
+type AskQuestion struct {
+	Question    string      `json:"question"`
+	Header      string      `json:"header"`
+	Options     []AskOption `json:"options"`
+	MultiSelect bool        `json:"multiSelect"`
+}
+
+// AskOption represents a selectable option within a question
+type AskOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description"`
+}
+
+// UsageData holds token usage information from Claude CLI
+type UsageData struct {
+	InputTokens              int `json:"input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+}
+
+// TotalInputTokens returns input_tokens + cache_creation + cache_read
+func (u *UsageData) TotalInputTokens() int {
+	return u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens
+}
+
 // StreamResponse represents a streaming JSON response from Claude CLI
 type StreamResponse struct {
-	Type   string `json:"type"`
+	Type  string `json:"type"`
+	Index int    `json:"index,omitempty"` // content_block_delta index
+	Delta *struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"delta,omitempty"` // content_block_delta text
 	Result string `json:"result,omitempty"` // Final result from "result" type
 	Message struct {
-		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"content"`
+		Content []ContentBlock `json:"content"`
+		Usage   *UsageData     `json:"usage,omitempty"`
 	} `json:"message,omitempty"`
 	// For stream_event with --include-partial-messages
 	Event *StreamEventData `json:"event,omitempty"`
+	Usage *UsageData       `json:"usage,omitempty"` // top-level (result type)
 }
 
 // StreamEventData represents the event data in stream_event
@@ -59,9 +95,11 @@ type StreamEventData struct {
 	} `json:"delta,omitempty"`
 }
 
-// SendMessage sends a message to Claude CLI and returns the response and turn count.
+// SendMessage sends a message to Claude CLI and returns the response, turn count, and optional pending question.
 // The turn count tracks how many agentic turns (tool-use cycles) were used.
-func (w *CLIWrapper) SendMessage(ctx context.Context, conversationID, message string, files []string, model string, workDir string, maxTurns int, systemPrompt string, permissionMode string, tools string, onChunk func(string)) (string, int, error) {
+// If Claude invokes AskUserQuestion, the pending question data is returned for interactive handling.
+// The agents parameter, when non-empty, is passed as --agents JSON to enable sub-agent delegation.
+func (w *CLIWrapper) SendMessage(ctx context.Context, conversationID, message string, files []string, model string, workDir string, maxTurns int, systemPrompt string, permissionMode string, tools string, agents string, onChunk func(string), onToolActivity func(string, string), onUsage func(int, int)) (string, int, *AskUserQuestionData, error) {
 	sessionID := w.getOrCreateSessionID(conversationID)
 	isResume := w.IsSessionStarted(conversationID)
 
@@ -85,20 +123,21 @@ func (w *CLIWrapper) SendMessage(ctx context.Context, conversationID, message st
 	}
 
 	// Permission mode: "plan" for read-only, "bypassPermissions" for full access
-	if permissionMode != "" {
-		args = append(args, "--permission-mode", permissionMode)
-	} else {
-		args = append(args, "--dangerously-skip-permissions")
+	if permissionMode == "" {
+		permissionMode = "bypassPermissions"
 	}
+	args = append(args, "--permission-mode", permissionMode)
 
 	// Pass model flag if specified
 	if model != "" {
 		args = append(args, "--model", model)
 	}
 
-	// Limit turns if specified
+	// Limit turns — 0 means unlimited, so pass a large value to override CLI default (100)
 	if maxTurns > 0 {
 		args = append(args, "--max-turns", fmt.Sprintf("%d", maxTurns))
+	} else {
+		args = append(args, "--max-turns", "999")
 	}
 
 	// Append system prompt (adds to default, doesn't replace)
@@ -109,6 +148,14 @@ func (w *CLIWrapper) SendMessage(ctx context.Context, conversationID, message st
 	// Restrict available tools (e.g., "Read,Glob,Grep" for plan mode)
 	if tools != "" {
 		args = append(args, "--tools", tools)
+	}
+
+	// Always allow AskUserQuestion in --print mode for GUI interactive handling
+	args = append(args, "--allowedTools", "AskUserQuestion")
+
+	// Pass agents JSON for sub-agent delegation (Teams mode)
+	if agents != "" {
+		args = append(args, "--agents", agents)
 	}
 
 	// Include image files using @path syntax for Claude Code CLI
@@ -125,32 +172,28 @@ func (w *CLIWrapper) SendMessage(ctx context.Context, conversationID, message st
 	if workDir != "" {
 		cmd.Dir = workDir
 	}
-	// Create a new process group so we can kill all child processes
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	// killProcessGroup kills the entire process group (parent + all children)
-	killProcessGroup := func() {
+	// killProcess terminates the claude process
+	killProcess := func() {
 		if cmd.Process != nil {
-			pgid := cmd.Process.Pid
-			fmt.Printf("[CLIWrapper] Killing process group (pgid: %d)\n", pgid)
-			syscall.Kill(-pgid, syscall.SIGKILL)
+			fmt.Printf("[CLIWrapper] Killing process (pid: %d)\n", cmd.Process.Pid)
+			cmd.Process.Kill()
 		}
 	}
 
 	// Use stdout pipe instead of PTY to get clean JSON output
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return "", 0, fmt.Errorf("failed to create stdout pipe: %w", err)
+		return "", 0, nil, fmt.Errorf("failed to create stdout pipe: %w", err)
 	}
 
 	// Capture stderr for debugging
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return "", 0, fmt.Errorf("failed to create stderr pipe: %w", err)
+		return "", 0, nil, fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
 	if err := cmd.Start(); err != nil {
-		return "", 0, fmt.Errorf("failed to start claude: %w", err)
+		return "", 0, nil, fmt.Errorf("failed to start claude: %w", err)
 	}
 
 	// Monitor context for cancellation (backup — main loop also handles ctx.Done)
@@ -159,7 +202,7 @@ func (w *CLIWrapper) SendMessage(ctx context.Context, conversationID, message st
 	go func() {
 		select {
 		case <-ctx.Done():
-			killProcessGroup()
+			killProcess()
 		case <-done:
 		}
 	}()
@@ -195,11 +238,45 @@ func (w *CLIWrapper) SendMessage(ctx context.Context, conversationID, message st
 	}()
 
 	var fullResponse string
+	var streamingText string // 현재 턴의 실시간 스트리밍 텍스트 누적
+	var toolActivityText string // 도구 활동 항목 (인라인 표시용)
+	var pendingQuestion *AskUserQuestionData
 	turnCount := 0
 	stalled := false
+	var totalInputTokens, totalOutputTokens int
 	stallTimeout := 10 * time.Minute
 	timer := time.NewTimer(stallTimeout)
 	defer timer.Stop()
+
+	// buildDisplayResponse combines fullResponse, streamingText, and tool activity lines.
+	buildDisplayResponse := func() string {
+		display := fullResponse
+		if streamingText != "" {
+			if display != "" {
+				display += "\n\n" + streamingText
+			} else {
+				display = streamingText
+			}
+		}
+		if toolActivityText != "" {
+			display += "\n\n" + toolActivityText
+		}
+		return display
+	}
+
+	// buildFinalResponse combines fullResponse and streamingText, excluding tool activity
+	// (tool activity is stored separately in the ToolUses array)
+	buildFinalResponse := func() string {
+		display := fullResponse
+		if streamingText != "" {
+			if display != "" {
+				display += "\n\n" + streamingText
+			} else {
+				display = streamingText
+			}
+		}
+		return display
+	}
 
 	lineNum := 0
 loop:
@@ -244,13 +321,23 @@ loop:
 				turnCount++
 			}
 
+				// 실시간 스트리밍: content_block_delta에서 텍스트 추출
+			if resp.Type == "content_block_delta" && resp.Delta != nil && resp.Delta.Type == "text_delta" && resp.Delta.Text != "" {
+				streamingText += resp.Delta.Text
+				if onChunk != nil {
+					onChunk(buildDisplayResponse())
+				}
+				continue
+			}
+
 			if resp.Type == "result" && resp.Result != "" {
 				fmt.Printf("[CLIWrapper] Final result (length: %d)\n", len(resp.Result))
 				fullResponse = resp.Result
 				if onChunk != nil {
-					onChunk(fullResponse)
+					onChunk(buildDisplayResponse())
 				}
 			} else if resp.Type == "assistant" && len(resp.Message.Content) > 0 {
+				streamingText = "" // 완전한 메시지로 대체되므로 스트리밍 버퍼 리셋
 				for _, content := range resp.Message.Content {
 					if content.Type == "text" && content.Text != "" {
 						fmt.Printf("[CLIWrapper] Assistant message (length: %d)\n", len(content.Text))
@@ -259,21 +346,71 @@ loop:
 						}
 						fullResponse += content.Text
 						if onChunk != nil {
-							onChunk(fullResponse)
+							onChunk(buildDisplayResponse())
+						}
+					} else if content.Type == "tool_use" && content.Name == "AskUserQuestion" {
+						fmt.Printf("[CLIWrapper] AskUserQuestion tool_use detected (id: %s)\n", content.ID)
+						var askInput struct {
+							Questions []AskQuestion `json:"questions"`
+						}
+						if err := json.Unmarshal(content.Input, &askInput); err == nil {
+							pendingQuestion = &AskUserQuestionData{
+								ToolUseID: content.ID,
+								Questions: askInput.Questions,
+							}
+							fmt.Printf("[CLIWrapper] Parsed %d questions from AskUserQuestion\n", len(askInput.Questions))
+						} else {
+							fmt.Printf("[CLIWrapper] Failed to parse AskUserQuestion input: %v\n", err)
+						}
+					} else if content.Type == "tool_use" && content.Name != "AskUserQuestion" {
+						if onToolActivity != nil {
+							detail := extractToolDetail(content.Name, content.Input)
+							onToolActivity(content.Name, detail)
+						}
+						// 인라인으로 도구 활동 추가
+						detail := extractToolDetail(content.Name, content.Input)
+						entry := fmt.Sprintf("%s **%s** %s", toolIcon(content.Name), content.Name, detail)
+						if toolActivityText != "" {
+							toolActivityText += "\\\n" + entry
+						} else {
+							toolActivityText = entry
+						}
+						if onChunk != nil {
+							onChunk(buildDisplayResponse())
 						}
 					}
 				}
+				// Extract usage from assistant message (accumulate across turns, include cache tokens)
+				if resp.Message.Usage != nil && onUsage != nil {
+					u := resp.Message.Usage
+					totalInputTokens += u.TotalInputTokens()
+					totalOutputTokens += u.OutputTokens
+					fmt.Printf("[CLIWrapper] Usage: input=%d (cache_create=%d, cache_read=%d), output=%d, total: in=%d out=%d\n",
+						u.InputTokens, u.CacheCreationInputTokens, u.CacheReadInputTokens, u.OutputTokens,
+						totalInputTokens, totalOutputTokens)
+					onUsage(totalInputTokens, totalOutputTokens)
+				}
+			}
+			// Extract usage from result message (accumulate, include cache tokens)
+			if resp.Type == "result" && resp.Usage != nil && onUsage != nil {
+				u := resp.Usage
+				totalInputTokens += u.TotalInputTokens()
+				totalOutputTokens += u.OutputTokens
+				fmt.Printf("[CLIWrapper] Result usage: input=%d (cache_create=%d, cache_read=%d), output=%d, total: in=%d out=%d\n",
+					u.InputTokens, u.CacheCreationInputTokens, u.CacheReadInputTokens, u.OutputTokens,
+					totalInputTokens, totalOutputTokens)
+				onUsage(totalInputTokens, totalOutputTokens)
 			}
 
 		case <-timer.C:
 			stalled = true
 			fmt.Printf("[CLIWrapper] Stall timeout (%v) - no output received, killing process group\n", stallTimeout)
-			killProcessGroup()
+			killProcess()
 			break loop
 
 		case <-ctx.Done():
 			fmt.Printf("[CLIWrapper] Context cancelled, killing process group\n")
-			killProcessGroup()
+			killProcess()
 			if !isResume {
 				w.markSessionStarted(conversationID)
 			}
@@ -289,31 +426,93 @@ loop:
 		if !isResume && strings.Contains(stderrStr, "already in use") {
 			fmt.Printf("[CLIWrapper] Session already in use, retrying with --resume\n")
 			w.markSessionStarted(conversationID)
-			return w.SendMessage(ctx, conversationID, message, files, model, workDir, maxTurns, systemPrompt, permissionMode, tools, onChunk)
+			return w.SendMessage(ctx, conversationID, message, files, model, workDir, maxTurns, systemPrompt, permissionMode, tools, agents, onChunk, onToolActivity, onUsage)
 		}
 		// If resume failed with no output, fall back to a fresh session
-		if fullResponse == "" && isResume {
+		if fullResponse == "" && isResume && pendingQuestion == nil {
 			fmt.Printf("[CLIWrapper] Resume failed, falling back to fresh session\n")
 			w.ClearSession(conversationID)
-			return w.SendMessage(ctx, conversationID, message, files, model, workDir, maxTurns, systemPrompt, permissionMode, tools, onChunk)
+			return w.SendMessage(ctx, conversationID, message, files, model, workDir, maxTurns, systemPrompt, permissionMode, tools, agents, onChunk, onToolActivity, onUsage)
 		}
-		if fullResponse != "" {
+		if fullResponse != "" || pendingQuestion != nil {
 			if stalled {
 				fullResponse += "\n\n---\n⚠️ 응답 대기 시간이 초과되어 프로세스가 중단되었습니다."
 			}
 			w.markSessionStarted(conversationID)
-			return fullResponse, turnCount, nil
+			return buildFinalResponse(), turnCount, pendingQuestion, nil
 		}
 		if stalled {
-			return "", turnCount, fmt.Errorf("응답 대기 시간 초과 (10분간 출력 없음)")
+			return "", turnCount, nil, fmt.Errorf("응답 대기 시간 초과 (10분간 출력 없음)")
 		}
-		return "", turnCount, fmt.Errorf("claude command failed: %w", err)
+		return "", turnCount, nil, fmt.Errorf("claude command failed: %w", err)
 	}
 
 	w.markSessionStarted(conversationID)
-	fmt.Printf("[CLIWrapper] Response received (length: %d, lines: %d, turns: %d)\n", len(fullResponse), lineNum, turnCount)
+	fmt.Printf("[CLIWrapper] Response received (length: %d, lines: %d, turns: %d, pendingQuestion: %v)\n", len(fullResponse), lineNum, turnCount, pendingQuestion != nil)
 
-	return fullResponse, turnCount, nil
+	return buildFinalResponse(), turnCount, pendingQuestion, nil
+}
+
+
+// toolIcon returns an emoji icon for a given tool name.
+func toolIcon(name string) string {
+	icons := map[string]string{
+		"Read": "📖", "Write": "📁", "Edit": "✏️", "Bash": "💻",
+		"Glob": "🔍", "Grep": "🔎", "WebSearch": "🌐", "WebFetch": "🌐", "Task": "📋",
+	}
+	if icon, ok := icons[name]; ok {
+		return icon
+	}
+	return "⚙️"
+}
+
+// extractToolDetail extracts a human-readable detail string from a tool_use input
+func extractToolDetail(toolName string, input json.RawMessage) string {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(input, &raw); err != nil {
+		return ""
+	}
+	switch toolName {
+	case "Read", "Write", "Edit":
+		if fp, ok := raw["file_path"].(string); ok {
+			return shortPath(fp)
+		}
+	case "Bash":
+		if cmd, ok := raw["command"].(string); ok {
+			if len(cmd) > 60 {
+				cmd = cmd[:60] + "..."
+			}
+			return cmd
+		}
+	case "Glob":
+		if p, ok := raw["pattern"].(string); ok {
+			return p
+		}
+	case "Grep":
+		if p, ok := raw["pattern"].(string); ok {
+			return p
+		}
+	case "WebSearch":
+		if q, ok := raw["query"].(string); ok {
+			return q
+		}
+	case "Task":
+		if d, ok := raw["description"].(string); ok {
+			if len(d) > 60 {
+				d = d[:60] + "..."
+			}
+			return d
+		}
+	}
+	return ""
+}
+
+// shortPath returns just the filename from a full path
+func shortPath(fullPath string) string {
+	if i := strings.LastIndex(fullPath, "/"); i >= 0 {
+		return fullPath[i+1:]
+	}
+	return fullPath
 }
 
 // getOrCreateSessionID gets or creates a session ID for a conversation
@@ -358,6 +557,66 @@ func (w *CLIWrapper) ClearSession(conversationID string) {
 	fmt.Printf("[CLIWrapper] Cleared session for %s\n", conversationID)
 }
 
+// SetSession assigns an existing session ID and marks it as started (resume mode).
+func (w *CLIWrapper) SetSession(conversationID, sessionID string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.sessionIDs[conversationID] = sessionID
+	w.sessionStarted[conversationID] = true
+	fmt.Printf("[CLIWrapper] Set session for %s: %s\n", conversationID, sessionID[:8])
+}
+
+// SessionState holds the persisted session info for a single conversation
+type SessionState struct {
+	SessionID string
+	Started   bool
+}
+
+// ExportSessions returns a snapshot of all session mappings (for persistence).
+// Agent sessions (prefixed with __agent__) are excluded.
+func (w *CLIWrapper) ExportSessions() map[string]SessionState {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	out := make(map[string]SessionState, len(w.sessionIDs))
+	for convID, sid := range w.sessionIDs {
+		if strings.HasPrefix(convID, AgentSessionPrefix) {
+			continue
+		}
+		out[convID] = SessionState{
+			SessionID: sid,
+			Started:   w.sessionStarted[convID],
+		}
+	}
+	return out
+}
+
+// GetAgentSessionUUIDs returns the set of session UUIDs used by background agents.
+func (w *CLIWrapper) GetAgentSessionUUIDs() map[string]bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	uuids := make(map[string]bool)
+	for convID, sid := range w.sessionIDs {
+		if strings.HasPrefix(convID, AgentSessionPrefix) {
+			uuids[sid] = true
+		}
+	}
+	return uuids
+}
+
+// ImportSessions restores session mappings from a persisted snapshot
+func (w *CLIWrapper) ImportSessions(mappings map[string]SessionState) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for convID, state := range mappings {
+		w.sessionIDs[convID] = state.SessionID
+		w.sessionStarted[convID] = state.Started
+	}
+	fmt.Printf("[CLIWrapper] Imported %d session mappings\n", len(mappings))
+}
+
 // Close cleans up resources
 func (w *CLIWrapper) Close() error {
 	// Nothing to clean up for CLI wrapper
@@ -371,62 +630,11 @@ var (
 	shellEnvCached []string // "KEY=VALUE" pairs from the user's login shell
 )
 
-// loadShellEnv sources the user's shell profile and captures the resulting environment.
-func loadShellEnv() []string {
-	// Detect the user's login shell
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/zsh" // macOS default
-	}
-
-	// Build a command that sources the profile and prints env
-	// -l = login shell (sources profile), -i = interactive (sources rc)
-	// We use -l only to avoid side effects of interactive mode
-	var profileArg string
-	if strings.HasSuffix(shell, "zsh") {
-		profileArg = "source ~/.zprofile 2>/dev/null; source ~/.zshrc 2>/dev/null; env"
-	} else {
-		profileArg = "source ~/.bash_profile 2>/dev/null; source ~/.bashrc 2>/dev/null; env"
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, shell, "-c", profileArg)
-	cmd.Dir, _ = os.UserHomeDir()
-	out, err := cmd.Output()
-	if err != nil {
-		fmt.Printf("[EnrichedEnv] Failed to source shell profile (%s): %v, falling back to os.Environ()\n", shell, err)
-		return nil
-	}
-
-	var envVars []string
-	for _, line := range strings.Split(string(out), "\n") {
-		if strings.Contains(line, "=") {
-			envVars = append(envVars, line)
-		}
-	}
-
-	fmt.Printf("[EnrichedEnv] Loaded %d env vars from %s profile\n", len(envVars), shell)
-	return envVars
-}
-
-// EnrichedEnv returns the user's full shell environment (from .zshrc/.bashrc)
-// with optional extra KEY=VALUE pairs appended.
-// On first call it sources the shell profile and caches the result.
-// Falls back to os.Environ() + common paths if sourcing fails.
+// EnrichedEnv returns the current environment with common binary paths prepended.
+// This ensures claude CLI can be found in Homebrew, nvm, etc. paths.
 func EnrichedEnv(extra ...string) []string {
 	shellEnvOnce.Do(func() {
-		shellEnvCached = loadShellEnv()
-	})
-
-	var env []string
-	if shellEnvCached != nil {
-		env = make([]string, len(shellEnvCached))
-		copy(env, shellEnvCached)
-	} else {
-		// Fallback: os.Environ() + common binary paths
-		env = os.Environ()
+		env := os.Environ()
 		extraPaths := []string{
 			"/opt/homebrew/bin",
 			"/opt/homebrew/sbin",
@@ -434,18 +642,52 @@ func EnrichedEnv(extra ...string) []string {
 			"/usr/local/sbin",
 		}
 		if home, err := os.UserHomeDir(); err == nil {
-			extraPaths = append(extraPaths, home+"/.local/bin")
+			extraPaths = append(extraPaths,
+				home+"/.local/bin",
+				home+"/.npm-global/bin",
+				home+"/.volta/bin",
+				home+"/.bun/bin",
+				home+"/.fnm/aliases/default/bin",
+				home+"/.yarn/bin",
+				home+"/.pnpm",
+				home+"/Library/pnpm",
+				home+"/.proto/shims",
+				home+"/.asdf/shims",
+			)
+			// nvm: find active node version bin path
+			nvmDir := home + "/.nvm/versions/node"
+			if entries, err := os.ReadDir(nvmDir); err == nil {
+				for i := len(entries) - 1; i >= 0; i-- {
+					if entries[i].IsDir() {
+						extraPaths = append(extraPaths, nvmDir+"/"+entries[i].Name()+"/bin")
+						break // latest version only
+					}
+				}
+			}
+			// fnm: find current version bin path
+			fnmDir := home + "/Library/Application Support/fnm/node-versions"
+			if entries, err := os.ReadDir(fnmDir); err == nil {
+				for i := len(entries) - 1; i >= 0; i-- {
+					if entries[i].IsDir() {
+						extraPaths = append(extraPaths, fnmDir+"/"+entries[i].Name()+"/installation/bin")
+						break
+					}
+				}
+			}
 		}
 		for i, e := range env {
 			if strings.HasPrefix(e, "PATH=") {
-				current := e[5:]
-				env[i] = "PATH=" + strings.Join(extraPaths, ":") + ":" + current
-				return append(env, extra...)
+				env[i] = "PATH=" + strings.Join(extraPaths, ":") + ":" + e[5:]
+				shellEnvCached = env
+				return
 			}
 		}
 		env = append(env, "PATH="+strings.Join(extraPaths, ":"))
-	}
+		shellEnvCached = env
+	})
 
+	env := make([]string, len(shellEnvCached))
+	copy(env, shellEnvCached)
 	return append(env, extra...)
 }
 

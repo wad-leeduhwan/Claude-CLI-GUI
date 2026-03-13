@@ -164,6 +164,7 @@
           class:dragging={draggingPanel?.id === panel.id}
           class:drag-over={dragOverPanel?.id === panel.id}
           class:admin-mode={tab.adminMode}
+          class:teams-mode={tab.teamsMode}
           draggable="true"
           on:dragstart={(e) => startDrag(e, panel)}
           on:dragover={(e) => dragOver(e, panel)}
@@ -185,6 +186,7 @@
               tabName={tab.name}
               messages={tab.messages}
               adminMode={tab.adminMode}
+              teamsMode={tab.teamsMode}
               on:refresh={loadData}
             />
           </div>

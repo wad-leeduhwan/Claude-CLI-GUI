@@ -1,11 +1,12 @@
 <script>
   import { onMount, onDestroy } from 'svelte';
   import SplitPane from './SplitPane.svelte';
-  import { GetTabs, AddNewTab, RemoveTab, GetWebSocketPort, GetClaudeVersion } from '../../../wailsjs/go/main/App';
+  import { GetTabs, AddNewTab, RemoveTab, GetWebSocketPort, GetClaudeVersion, CheckForUpdate, GetAppVersion, DetectInstallMethod, UpdateClaude, GetReleaseNotes, TranslateReleaseNotes, OpenChangelogPage } from '../../../wailsjs/go/main/App';
   import { EventsOn, EventsOff } from '../../../wailsjs/runtime/runtime';
   import { streamingStore } from '../stores/streaming.js';
   import { modelStore } from '../stores/model.js';
   import { theme } from '../stores/theme.js';
+  import { agentStore } from '../stores/agent.js';
 
   $: isDark = $theme === 'dark';
 
@@ -19,6 +20,121 @@
   let isAnyTabStreaming = false;
   let pendingTabsUpdate = false;
   let claudeVersion = '';
+  let appVersion = '';
+  let updateInfo = null;
+  let showUpdatePopup = false;
+  let copySuccess = false;
+  let updateCheckInterval = null;
+  let isUpdating = false;
+  let updateResult = null;
+  let installMethod = null;
+  let installMethodLoading = true;
+  let releaseNotes = [];
+  let releaseNotesLoading = false;
+  let isTranslated = false;
+  let isTranslating = false;
+  let translatedNotes = [];
+
+  const UPDATE_COMMAND_NPM = 'npm install -g @anthropic-ai/claude-code';
+  const UPDATE_COMMAND_BREW = 'brew upgrade claude-code';
+
+  async function checkUpdate() {
+    try {
+      const info = await CheckForUpdate();
+      updateInfo = info;
+      if (info.currentVersion) {
+        claudeVersion = info.currentVersion;
+      }
+    } catch (e) {
+      console.error('[DynamicSplitLayout] Failed to check for update:', e);
+    }
+  }
+
+  function toggleUpdatePopup() {
+    showUpdatePopup = !showUpdatePopup;
+    if (showUpdatePopup && installMethod === null) {
+      installMethodLoading = true;
+      DetectInstallMethod().then(method => {
+        installMethod = method;
+        installMethodLoading = false;
+      }).catch(() => {
+        installMethod = 'unknown';
+        installMethodLoading = false;
+      });
+    }
+    if (showUpdatePopup && updateInfo?.updateAvailable && releaseNotes.length === 0) {
+      releaseNotesLoading = true;
+      GetReleaseNotes(updateInfo.currentVersion, updateInfo.latestVersion).then(notes => {
+        releaseNotes = notes || [];
+        releaseNotesLoading = false;
+      }).catch(() => {
+        releaseNotes = [];
+        releaseNotesLoading = false;
+      });
+    }
+  }
+
+  function closeUpdatePopup() {
+    showUpdatePopup = false;
+  }
+
+  async function handleAutoUpdate() {
+    isUpdating = true;
+    updateResult = null;
+    try {
+      const result = await UpdateClaude();
+      updateResult = result;
+      if (result.success && result.newVersion) {
+        claudeVersion = result.newVersion;
+        releaseNotes = [];
+        await checkUpdate();
+      }
+    } catch (e) {
+      updateResult = { success: false, error: e.toString(), output: '' };
+    } finally {
+      isUpdating = false;
+    }
+  }
+
+  async function copyCommand(cmd) {
+    try {
+      await navigator.clipboard.writeText(cmd);
+      copySuccess = true;
+      setTimeout(() => { copySuccess = false; }, 2000);
+    } catch (e) {
+      console.error('Failed to copy:', e);
+    }
+  }
+
+  async function translateNotes() {
+    if (isTranslated) {
+      isTranslated = false;
+      return;
+    }
+    if (translatedNotes.length > 0) {
+      isTranslated = true;
+      return;
+    }
+    isTranslating = true;
+    try {
+      translatedNotes = await TranslateReleaseNotes();
+      isTranslated = true;
+    } catch (e) {
+      console.error('[DynamicSplitLayout] Translation failed:', e);
+    } finally {
+      isTranslating = false;
+    }
+  }
+
+  function openChangelog() {
+    OpenChangelogPage();
+  }
+
+  function handleOutsideClick(event) {
+    if (showUpdatePopup && !event.target.closest('.update-popup-container')) {
+      closeUpdatePopup();
+    }
+  }
 
   // Event handler functions (defined outside onMount for cleanup)
   function handleUserMessageAdded(tabID) {
@@ -60,6 +176,32 @@
     }
   }
 
+  // Agent event handlers
+  function handleAgentTabRename(data) {
+    console.log('[Agent] tab-rename:', data);
+    agentStore.setTabRename(data.tabID, data.name);
+  }
+
+  function handleAgentProjectSummary(data) {
+    console.log('[Agent] project-summary:', data);
+    agentStore.setProjectSummary(data.workDir, data);
+  }
+
+  function handleAgentClaudeMdSuggestion(data) {
+    console.log('[Agent] claudemd-suggestion:', data);
+    agentStore.setClaudeMdSuggestion(data.workDir, data.content);
+  }
+
+  function handleAgentContextRecommendation(data) {
+    console.log('[Agent] context-recommendation:', data);
+    agentStore.setContextRecommendation(data.tabID, data.files);
+  }
+
+  function handleAgentCodeReview(data) {
+    console.log('[Agent] code-review:', data);
+    agentStore.setCodeReview(data.tabID, data);
+  }
+
   onMount(async () => {
     console.log('[DynamicSplitLayout] Component mounted');
 
@@ -80,6 +222,11 @@
     EventsOff('streaming-start');
     EventsOff('streaming-chunk');
     EventsOff('streaming-end');
+    EventsOff('agent-tab-rename');
+    EventsOff('agent-project-summary');
+    EventsOff('agent-claudemd-suggestion');
+    EventsOff('agent-context-recommendation');
+    EventsOff('agent-code-review');
 
     // Register Wails event listeners (backup for non-streaming events)
     EventsOn('user-message-added', handleUserMessageAdded);
@@ -89,22 +236,45 @@
     EventsOn('streaming-chunk', handleStreamingChunk);
     EventsOn('streaming-end', handleStreamingEnd);
 
+    // Agent background task events
+    EventsOn('agent-tab-rename', handleAgentTabRename);
+    EventsOn('agent-project-summary', handleAgentProjectSummary);
+    EventsOn('agent-claudemd-suggestion', handleAgentClaudeMdSuggestion);
+    EventsOn('agent-context-recommendation', handleAgentContextRecommendation);
+    EventsOn('agent-code-review', handleAgentCodeReview);
+
     console.log('[DynamicSplitLayout] Event listeners registered');
     await loadTabs();
 
     // Initialize model store
     await modelStore.refresh();
 
-    // Load Claude CLI version
+    // Load app version and Claude CLI version
+    try {
+      appVersion = await GetAppVersion();
+    } catch (e) {
+      appVersion = 'dev';
+    }
     try {
       claudeVersion = await GetClaudeVersion();
     } catch (e) {
       claudeVersion = 'unknown';
     }
+
+    // Check for updates
+    await checkUpdate();
+
+    // Re-check every 30 minutes
+    updateCheckInterval = setInterval(checkUpdate, 30 * 60 * 1000);
   });
 
   onDestroy(() => {
     console.log('[DynamicSplitLayout] Component destroyed, cleaning up');
+    // Clear update check interval
+    if (updateCheckInterval) {
+      clearInterval(updateCheckInterval);
+      updateCheckInterval = null;
+    }
     // Disconnect WebSocket
     streamingStore.disconnect();
     // Clean up Wails event listeners
@@ -113,6 +283,11 @@
     EventsOff('streaming-start');
     EventsOff('streaming-chunk');
     EventsOff('streaming-end');
+    EventsOff('agent-tab-rename');
+    EventsOff('agent-project-summary');
+    EventsOff('agent-claudemd-suggestion');
+    EventsOff('agent-context-recommendation');
+    EventsOff('agent-code-review');
   });
 
   async function loadTabs() {
@@ -453,8 +628,150 @@
       정렬
     </button>
     <div class="toolbar-spacer"></div>
+    {#if appVersion}
+      <span class="app-version">{appVersion}</span>
+    {/if}
     {#if claudeVersion}
-      <span class="cli-version">{claudeVersion}</span>
+      <div class="update-popup-container">
+        {#if updateInfo?.updateAvailable}
+          <button class="cli-version has-update" on:click={toggleUpdatePopup}>
+            {claudeVersion} <span class="update-arrow">&#8593; {updateInfo.latestVersion}</span>
+          </button>
+        {:else}
+          <span class="cli-version">{claudeVersion}</span>
+        {/if}
+        {#if showUpdatePopup}
+          <!-- svelte-ignore a11y-click-events-have-key-events -->
+          <div class="update-popup-backdrop" on:click={closeUpdatePopup}></div>
+          <div class="update-guide-popup">
+            <div class="update-popup-header">업데이트 안내</div>
+            <div class="update-popup-versions">
+              <span>현재: <strong>{updateInfo.currentVersion}</strong></span>
+              <span>최신: <strong>{updateInfo.latestVersion}</strong></span>
+            </div>
+
+            <!-- Release notes section -->
+            <div class="release-notes-section">
+              <div class="release-notes-toolbar">
+                <span class="release-notes-header">변경사항</span>
+                <div class="release-notes-actions">
+                  <button class="rn-action-btn" on:click={translateNotes} disabled={isTranslating}>
+                    {isTranslating ? '번역 중...' : isTranslated ? '원문 보기' : '한글 번역'}
+                  </button>
+                  <button class="rn-action-btn" on:click={openChangelog}>
+                    릴리즈 노트 →
+                  </button>
+                </div>
+              </div>
+              {#if releaseNotesLoading}
+                <div class="release-notes-loading">
+                  <span class="spinner"></span>
+                  <span>릴리즈 노트 로딩 중...</span>
+                </div>
+              {:else if releaseNotes.length > 0}
+                <div class="release-notes-list">
+                  {#each (isTranslated ? translatedNotes : releaseNotes) as note}
+                    <div class="release-note-item">
+                      <div class="release-note-meta">
+                        <span class="release-note-version">v{note.version}</span>
+                        {#if note.publishedAt}
+                          <span class="release-note-date">{new Date(note.publishedAt).toLocaleDateString()}</span>
+                        {/if}
+                      </div>
+                      {#if note.body}
+                        <ul class="release-note-body">
+                          {#each note.body.split('\n').filter(l => l.trim()) as line}
+                            <li>{line.replace(/^[-•]\s*/, '')}</li>
+                          {/each}
+                        </ul>
+                      {:else}
+                        <div class="release-note-body-empty">상세 내용 없음</div>
+                      {/if}
+                    </div>
+                  {/each}
+                </div>
+              {:else}
+                <div class="release-notes-empty">릴리즈 노트를 불러올 수 없습니다.</div>
+              {/if}
+            </div>
+
+            <!-- Auto update section -->
+            <div class="auto-update-section">
+              <div class="install-method-info">
+                {#if installMethodLoading}
+                  <span class="detect-loading">설치 방법 감지 중...</span>
+                {:else if installMethod === 'brew'}
+                  <span>설치 방법: <strong>Homebrew</strong></span>
+                {:else if installMethod === 'npm'}
+                  <span>설치 방법: <strong>npm</strong></span>
+                {:else}
+                  <span>설치 방법: <strong>알 수 없음</strong></span>
+                {/if}
+              </div>
+
+              {#if !isUpdating && !updateResult}
+                <button
+                  class="auto-update-btn"
+                  on:click={handleAutoUpdate}
+                  disabled={installMethodLoading || installMethod === 'unknown'}
+                >
+                  자동 업데이트
+                </button>
+              {/if}
+
+              {#if isUpdating}
+                <div class="update-progress">
+                  <span class="spinner"></span>
+                  <span>업데이트 중...</span>
+                </div>
+              {/if}
+
+              {#if updateResult}
+                {#if updateResult.success}
+                  <div class="update-success">
+                    업데이트 완료! 새 버전: <strong>{updateResult.newVersion}</strong>
+                  </div>
+                {:else}
+                  <div class="update-error">
+                    <div>업데이트 실패: {updateResult.error}</div>
+                    {#if updateResult.output}
+                      <details class="update-log">
+                        <summary>상세 로그</summary>
+                        <pre>{updateResult.output}</pre>
+                      </details>
+                    {/if}
+                    <button
+                      class="auto-update-btn retry"
+                      on:click={() => { updateResult = null; }}
+                    >
+                      다시 시도
+                    </button>
+                  </div>
+                {/if}
+              {/if}
+            </div>
+
+            <div class="update-popup-desc">또는 터미널에서 수동으로 실행:</div>
+            <div class="update-command-label">npm</div>
+            <div class="update-command">
+              <code>{UPDATE_COMMAND_NPM}</code>
+              <button class="copy-btn" on:click={() => copyCommand(UPDATE_COMMAND_NPM)} title="복사">
+                {copySuccess ? '✓' : '📋'}
+              </button>
+            </div>
+            <div class="update-command-label">Homebrew</div>
+            <div class="update-command">
+              <code>{UPDATE_COMMAND_BREW}</code>
+              <button class="copy-btn" on:click={() => copyCommand(UPDATE_COMMAND_BREW)} title="복사">
+                {copySuccess ? '✓' : '📋'}
+              </button>
+            </div>
+            <div class="update-popup-footer">
+              <button class="close-btn" on:click={closeUpdatePopup}>닫기</button>
+            </div>
+          </div>
+        {/if}
+      </div>
     {/if}
     <label class="theme-toggle">
       <input type="checkbox" checked={isDark} on:change={toggleTheme} />
@@ -496,6 +813,17 @@
     flex: 1;
   }
 
+  .app-version {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+    padding: 2px 8px;
+    border: 1px solid var(--border-primary);
+    border-radius: 3px;
+    white-space: nowrap;
+    margin-right: 6px;
+  }
+
   .cli-version {
     font-size: 11px;
     color: var(--text-muted);
@@ -504,6 +832,139 @@
     border: 1px solid var(--border-primary);
     border-radius: 3px;
     white-space: nowrap;
+    background: none;
+  }
+
+  .cli-version.has-update {
+    cursor: pointer;
+    border-color: #10b981;
+    transition: background-color 0.2s, border-color 0.2s;
+  }
+
+  .cli-version.has-update:hover {
+    background-color: rgba(16, 185, 129, 0.1);
+  }
+
+  .update-arrow {
+    color: #10b981;
+    font-weight: 600;
+    margin-left: 4px;
+  }
+
+  .update-popup-container {
+    position: relative;
+  }
+
+  .update-popup-backdrop {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 199;
+  }
+
+  .update-guide-popup {
+    position: absolute;
+    top: calc(100% + 8px);
+    right: 0;
+    z-index: 200;
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: 8px;
+    padding: 16px;
+    min-width: 340px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+  }
+
+  .update-popup-header {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 12px;
+  }
+
+  .update-popup-versions {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-bottom: 12px;
+  }
+
+  .update-popup-versions strong {
+    color: var(--text-primary);
+    font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+  }
+
+  .update-popup-desc {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-bottom: 8px;
+  }
+
+  .update-command-label {
+    font-size: 10px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 4px;
+    margin-top: 8px;
+  }
+
+  .update-command {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    padding: 8px 10px;
+  }
+
+  .update-command code {
+    flex: 1;
+    font-size: 11px;
+    font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+    color: var(--text-primary);
+    word-break: break-all;
+  }
+
+  .copy-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 14px;
+    padding: 2px 4px;
+    border-radius: 3px;
+    transition: background-color 0.2s;
+  }
+
+  .copy-btn:hover {
+    background-color: var(--border-primary);
+  }
+
+  .update-popup-footer {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 12px;
+  }
+
+  .close-btn {
+    font-size: 12px;
+    padding: 4px 12px;
+    background-color: var(--bg-primary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background-color 0.2s;
+  }
+
+  .close-btn:hover {
+    background-color: var(--border-primary);
+    color: var(--text-primary);
   }
 
   .theme-toggle {
@@ -591,5 +1052,246 @@
   .empty-state p {
     margin: 0;
     font-size: 1.2em;
+  }
+
+  /* Release notes styles */
+  .release-notes-section {
+    margin-bottom: 12px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border-primary);
+  }
+
+  .release-notes-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+
+  .release-notes-header {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .release-notes-actions {
+    display: flex;
+    gap: 4px;
+    margin-left: auto;
+  }
+
+  .rn-action-btn {
+    font-size: 10px;
+    padding: 2px 6px;
+    background: none;
+    color: var(--text-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: 3px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background-color 0.2s, color 0.2s;
+  }
+
+  .rn-action-btn:hover:not(:disabled) {
+    background-color: var(--border-primary);
+    color: var(--text-primary);
+  }
+
+  .rn-action-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .release-notes-loading {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--text-muted);
+    padding: 8px 0;
+  }
+
+  .release-notes-list {
+    max-height: 200px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .release-note-item {
+    padding: 8px;
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+  }
+
+  .release-note-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+  }
+
+  .release-note-version {
+    font-size: 12px;
+    font-weight: 600;
+    color: #10b981;
+    font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+  }
+
+  .release-note-date {
+    font-size: 11px;
+    color: var(--text-muted);
+  }
+
+  .release-note-body {
+    font-size: 11px;
+    color: var(--text-secondary);
+    line-height: 1.5;
+    margin: 4px 0 0 0;
+    padding-left: 18px;
+    list-style: disc;
+    text-align: left;
+  }
+
+  .release-note-body li {
+    margin-bottom: 2px;
+    word-break: break-word;
+  }
+
+  .release-note-body-empty {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-style: italic;
+  }
+
+  .release-notes-empty {
+    font-size: 12px;
+    color: var(--text-muted);
+    font-style: italic;
+    padding: 4px 0;
+  }
+
+  /* Auto-update styles */
+  .auto-update-section {
+    margin-bottom: 12px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border-primary);
+  }
+
+  .install-method-info {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin-bottom: 8px;
+  }
+
+  .install-method-info strong {
+    color: var(--text-primary);
+  }
+
+  .detect-loading {
+    color: var(--text-muted);
+    font-style: italic;
+  }
+
+  .auto-update-btn {
+    width: 100%;
+    padding: 8px 16px;
+    background-color: #10b981;
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+    transition: background-color 0.2s;
+  }
+
+  .auto-update-btn:hover:not(:disabled) {
+    background-color: #059669;
+  }
+
+  .auto-update-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .auto-update-btn.retry {
+    margin-top: 8px;
+    background-color: var(--bg-primary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-primary);
+  }
+
+  .auto-update-btn.retry:hover {
+    background-color: var(--border-primary);
+    color: var(--text-primary);
+  }
+
+  .update-progress {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--text-secondary);
+    padding: 8px 0;
+  }
+
+  .spinner {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    border: 2px solid var(--border-primary);
+    border-top-color: #10b981;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  @keyframes spin {
+    to { transform: rotate(360deg); }
+  }
+
+  .update-success {
+    font-size: 13px;
+    color: #10b981;
+    padding: 8px 0;
+    font-weight: 500;
+  }
+
+  .update-success strong {
+    font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+  }
+
+  .update-error {
+    font-size: 12px;
+    color: #ef4444;
+    padding: 8px 0;
+  }
+
+  .update-log {
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--text-secondary);
+  }
+
+  .update-log summary {
+    cursor: pointer;
+    color: var(--text-muted);
+    margin-bottom: 4px;
+  }
+
+  .update-log pre {
+    background-color: var(--bg-primary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    padding: 8px;
+    max-height: 120px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+    font-size: 10px;
+    margin: 0;
   }
 </style>

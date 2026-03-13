@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { marked } from 'marked';
   import hljs from 'highlight.js';
+  import { BrowserOpenURL } from '../../../wailsjs/runtime/runtime.js';
 
   export let content = '';
 
@@ -53,6 +54,23 @@
     }
   }
 
+  let containerEl;
+
+  function interceptLinks() {
+    if (!containerEl) return;
+    containerEl.querySelectorAll('a[href]').forEach((a) => {
+      if (a.dataset.intercepted) return;
+      a.dataset.intercepted = 'true';
+      a.addEventListener('click', (e) => {
+        e.preventDefault();
+        const href = a.getAttribute('href');
+        if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
+          BrowserOpenURL(href);
+        }
+      });
+    });
+  }
+
   function addCopyButtons() {
     // Add copy buttons to code blocks
     document.querySelectorAll('.markdown-content pre').forEach((pre) => {
@@ -83,20 +101,22 @@
       hljs.highlightElement(block);
     });
     addCopyButtons();
+    interceptLinks();
   });
 
   $: if (renderedHTML) {
-    // Re-apply highlighting and copy buttons when content changes
+    // Re-apply highlighting, copy buttons, and link interception when content changes
     setTimeout(() => {
       document.querySelectorAll('.markdown-content pre code').forEach((block) => {
         hljs.highlightElement(block);
       });
       addCopyButtons();
+      interceptLinks();
     }, 0);
   }
 </script>
 
-<div class="markdown-content">
+<div class="markdown-content" bind:this={containerEl}>
   {@html renderedHTML}
 </div>
 
@@ -231,6 +251,8 @@
     border-collapse: collapse;
     width: 100%;
     margin: 0.6em 0;
+    display: block;
+    overflow-x: auto;
   }
 
   .markdown-content :global(th),
@@ -349,4 +371,5 @@
   .markdown-content :global(.md-alert-caution .md-alert-title) {
     color: #ef4444;
   }
+
 </style>

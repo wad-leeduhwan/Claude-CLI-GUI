@@ -1,6 +1,6 @@
 <script>
-  import { createEventDispatcher, onDestroy, onMount, tick } from 'svelte';
-  import { SendMessage, SendAdminMessage, CancelMessage, CancelOrchestrationJob, RemoveLastUserMessage, TruncateMessages, ToggleTabAdminMode, ToggleTabPlanMode, SelectFiles, GetFileInfo, GetCurrentModel, SetModel, GetAvailableModels, SaveDroppedImage, SaveDroppedFile, ReadFileSnippet, CompletePath, SearchFiles, OpenExpandedView, IsGitRepo } from '../../../wailsjs/go/main/App';
+  import { createEventDispatcher, onDestroy, onMount, afterUpdate, tick } from 'svelte';
+  import { SendMessage, SendAdminMessage, SendTeamsMessage, CancelMessage, CancelOrchestrationJob, RemoveLastUserMessage, TruncateMessages, ToggleTabAdminMode, ToggleTabPlanMode, ToggleTabTeamsMode, SelectFiles, GetFileInfo, GetCurrentModel, SetModel, GetAvailableModels, SaveDroppedImage, SaveDroppedFile, ReadFileSnippet, CompletePath, SearchFiles, OpenExpandedView, IsGitRepo, AnswerQuestion, RequestCodeReview, GetPlanContent } from '../../../wailsjs/go/main/App';
   import MarkdownViewer from './MarkdownViewer.svelte';
   import SlashCommandPopup from './SlashCommandPopup.svelte';
   import FilePathPopup from './FilePathPopup.svelte';
@@ -8,16 +8,21 @@
   import { orchestratorStore } from '../stores/orchestrator.js';
   import { modelStore } from '../stores/model.js';
   import { findCommand, matchCommands, getAllCommands } from '../commands/registry.js';
+  import { focusedTabId } from '../stores/focusedTab.js';
   import '../../assets/hljs-github-dark.css';
 
   export let tabId;
   export let tabName;
   export let messages = [];
   export let adminMode = false;
+  export let teamsMode = false;
   export let planMode = false;
   export let workDir = '';
 
   let inputMessage = '';
+  let inputHistory = [];      // 보낸 메시지 히스토리 배열
+  let historyIndex = -1;      // 현재 히스토리 위치 (-1 = 새 입력 모드)
+  let historySavedInput = '';  // 히스토리 탐색 시작 전 입력값 임시 저장
   let sending = false;
   let messagesArea;
   let attachedFiles = []; // Array of {path: string, name: string, preview: string}
@@ -45,6 +50,26 @@
   let typingTimer = null;
   let fullContent = '';
 
+  // Streaming content overflow detection
+  let streamingWrapperEl = null;
+  let streamingBodyEl = null;
+  let streamingOverflowing = false;
+
+  afterUpdate(() => {
+    if (streamingWrapperEl && streamingBodyEl) {
+      streamingOverflowing = streamingBodyEl.scrollHeight > streamingWrapperEl.clientHeight;
+      if (streamingOverflowing) {
+        streamingWrapperEl.scrollTop = streamingWrapperEl.scrollHeight;
+      }
+    }
+  });
+
+  // Tool activity history toggle
+  let expandedProcessIndex = null;
+  function toggleProcess(index) {
+    expandedProcessIndex = expandedProcessIndex === index ? null : index;
+  }
+
   // Slash command popup state
   let showPopup = false;
   let popupCommands = [];
@@ -62,6 +87,10 @@
   let cliPanelSelectedIndex = 0;
   let cliPanelTimer = null;
   let choiceDismissed = false; // user explicitly closed the choice panel
+  let cliPanelEl; // focusable cli-panel element reference
+
+  // Image lightbox state
+  let lightboxSrc = null; // data URL of image to show full-size
 
   // Streaming elapsed time
   let streamingStartTime = null;
@@ -117,6 +146,11 @@
   const isMac = navigator.platform.toUpperCase().includes('MAC');
 
   onMount(() => {
+    // Set this tab as focused if no tab is focused yet
+    if (!$focusedTabId) {
+      focusedTabId.set(tabId);
+    }
+
     placeholderTimer = setInterval(() => {
       placeholderIndex = (placeholderIndex + 1) % placeholders.length;
       currentPlaceholder = placeholders[placeholderIndex];
@@ -135,6 +169,8 @@
 
   // Get streaming state directly from global store
   $: streamingContent = $streamingStore[tabId]?.content || '';
+  $: toolActivity = $streamingStore[tabId]?.toolActivity || null;
+  $: tokenUsage = $streamingStore[tabId]?.tokenUsage || null;
   $: console.log(`[ConversationTab ${tabId}] Store updated - content length: ${streamingContent.length}`);
 
   // When streaming content changes, start typing effect
@@ -146,13 +182,46 @@
   $: {
     const lastMsg = displayMessages.length > 0
       ? displayMessages[displayMessages.length - 1] : null;
-    const planReady = planMode && !sending && planResponseReceived && lastMsg && lastMsg.role === 'assistant';
+    const lastContent = lastMsg?.role === 'assistant' ? (lastMsg.content || '') : '';
+    const isAsking = lastContent && isAssistantAsking(lastContent);
+    const planReady = planMode && !sending && planResponseReceived && lastMsg && lastMsg.role === 'assistant' && !isAsking;
 
     if (planReady && (!cliPanel || cliPanel.type === 'plan-ready')) {
       cliPanel = { type: 'plan-ready' };
     } else if (!planReady && cliPanel && cliPanel.type === 'plan-ready') {
       cliPanel = null;
     }
+  }
+
+  // Reactive AskUserQuestion detection from streaming store
+  $: {
+    const pq = $streamingStore[tabId]?.pendingQuestion;
+    if (pq && (!cliPanel || cliPanel.type !== 'ask-user-question' || cliPanel.toolUseId !== pq.toolUseId)) {
+      cliPanel = {
+        type: 'ask-user-question',
+        questions: pq.questions,
+        toolUseId: pq.toolUseId,
+        currentStep: 0,
+        answers: {},
+        selectedIndex: 0,
+        reviewing: false,
+        customText: '',
+        showCustomInput: false
+      };
+    }
+  }
+
+  // Clear UI state when workDir changes (e.g., user switches project directory)
+  let lastWorkDir = workDir;
+  $: if (workDir !== lastWorkDir) {
+    console.log(`[ConversationTab ${tabId}] WorkDir changed: ${lastWorkDir} → ${workDir}`);
+    lastWorkDir = workDir;
+    displayMessages = [];
+    lastMessagesLength = 0;
+    sending = false;
+    stopTypingEffect();
+    stopStreamingTimer();
+    streamingStore.clear(tabId);
   }
 
   // Force reactivity when messages prop changes
@@ -248,6 +317,30 @@
     return m > 0 ? `${m}:${s.toString().padStart(2, '0')}` : `${s}s`;
   }
 
+  function getToolIcon(name) {
+    return { Read:'📖', Write:'📁', Edit:'✏️', Bash:'💻', Glob:'🔍', Grep:'🔎',
+             WebSearch:'🌐', WebFetch:'🌐', Task:'📋' }[name] || '⚙️';
+  }
+
+  function getToolLabel(name) {
+    return { Read:'Reading', Write:'Writing', Edit:'Editing', Bash:'Running',
+             Glob:'Searching', Grep:'Searching', WebSearch:'Searching',
+             WebFetch:'Fetching', Task:'Task' }[name] || name;
+  }
+
+  function formatTokens(n) {
+    if (!n || n <= 0) return '0';
+    if (n >= 1000000) {
+      const v = n / 1000000;
+      return (v >= 10 ? Math.round(v) : v.toFixed(1)) + 'm';
+    }
+    if (n >= 1000) {
+      const v = n / 1000;
+      return (v >= 10 ? Math.round(v) : v.toFixed(1)) + 'k';
+    }
+    return n.toString();
+  }
+
   function formatDuration(ms) {
     if (!ms || ms <= 0) return '';
     const sec = Math.floor(ms / 1000);
@@ -280,7 +373,7 @@
     const choices = [];
     let choiceStartIndex = -1;
 
-    // Scan from the end to find trailing numbered options
+    // Pass 1: Scan from end for numbered options (highest priority)
     let foundEnd = false;
     for (let i = lines.length - 1; i >= 0; i--) {
       const line = lines[i].trim();
@@ -288,18 +381,47 @@
         if (foundEnd) continue;
         continue;
       }
-      // Match patterns: "1. text", "1) text", "- 1. text", etc.
-      // Keep markdown intact — MarkdownViewer will render it
-      const match = line.match(/^(?:[-*]\s*)?(\d+)[.):\]]\s*(.+)$/);
-      if (match) {
-        choices.unshift({ num: match[1], text: match[2].trim() });
+      const numMatch = line.match(/^(?:[-*]\s*)?(\d+)[.):\]]\s*(.+)$/);
+      if (numMatch) {
+        choices.unshift({ num: numMatch[1], text: numMatch[2].trim() });
         choiceStartIndex = i;
         foundEnd = true;
       } else {
-        // Stop if we hit a non-choice line after finding choices
         if (foundEnd) break;
-        // Also stop if we've gone too far back (more than 20 lines)
         if (lines.length - i > 20) break;
+      }
+    }
+
+    // Pass 2: If no numbered choices, try bullet patterns as fallback
+    if (choices.length < 2) {
+      choices.length = 0;
+      choiceStartIndex = -1;
+      foundEnd = false;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].trim();
+        if (!line) {
+          if (foundEnd) continue;
+          continue;
+        }
+        const numMatch = line.match(/^(?:[-*]\s*)?(\d+)[.):\]]\s*(.+)$/);
+        if (numMatch) {
+          choices.unshift({ num: numMatch[1], text: numMatch[2].trim() });
+          choiceStartIndex = i;
+          foundEnd = true;
+        } else {
+          const bulletMatch = line.match(/^[-*]\s+(.+)$/);
+          if (bulletMatch) {
+            choices.unshift({ num: null, text: bulletMatch[1].trim() });
+            choiceStartIndex = i;
+            foundEnd = true;
+          } else {
+            break; // 불릿은 반드시 메시지 끝에 위치해야 함
+          }
+        }
+      }
+      // Auto-assign numbers to bullet-only choices
+      if (choices.some(c => c.num === null)) {
+        choices.forEach((c, i) => { if (c.num === null) c.num = String(i + 1); });
       }
     }
 
@@ -312,14 +434,16 @@
     for (let i = choiceStartIndex - 1; i >= 0 && i >= choiceStartIndex - 5; i--) {
       const line = lines[i].trim();
       if (!line) continue;
+      // Strip markdown inline formatting for pattern matching
+      const stripped = line.replace(/[*_`~]+/g, '').trim();
       // Check if line looks like a question (ends with ?, 까요?, 세요?, 나요?, etc.)
-      if (/[?？]$/.test(line) || /(?:까요|세요|나요|할까|는지|을까|ㄹ까)\s*[.?]?\s*$/.test(line)) {
-        question = line.replace(/^[#*\->\s]+/, '').trim(); // strip markdown prefixes
+      if (/[?？]$/.test(stripped) || /(?:까요|세요|나요|할까|는지|을까|ㄹ까)\s*[.?]?\s*$/.test(stripped)) {
+        question = stripped;
         break;
       }
       // Also accept lines that look like a prompt (e.g., "선택해주세요", "골라주세요")
-      if (/(?:선택|골라|알려|결정|지정)/.test(line) && line.length < 100) {
-        question = line.replace(/^[#*\->\s]+/, '').trim();
+      if (/(?:선택|골라|알려|결정|지정)/.test(stripped) && stripped.length < 100) {
+        question = stripped;
         break;
       }
     }
@@ -330,17 +454,49 @@
     return { question, choices };
   }
 
+  function isAssistantAsking(text) {
+    if (!text) return false;
+    const lines = text.trim().split('\n');
+    // Check if message ends with numbered choices (2+ consecutive)
+    let choiceCount = 0;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      if (/^(?:[-*]\s*)?(\d+)[.):\]]\s*.+$/.test(line)) {
+        choiceCount++;
+      } else {
+        break;
+      }
+    }
+    if (choiceCount >= 2) return true;
+
+    // Check if ends with question pattern
+    const lastNonEmpty = [...lines].reverse().find(l => l.trim());
+    if (!lastNonEmpty) return false;
+    const trimmed = lastNonEmpty.trim();
+    if (/[?？]\s*$/.test(trimmed)) return true;
+    if (/(?:까요|세요|나요|할까|는지|을까|ㄹ까|주세요)\s*[.?]?\s*$/.test(trimmed)) return true;
+    return false;
+  }
+
   // Reactively parse quick replies from displayed messages and show as CLI panel
   $: {
     const parsed = !sending ? parseQuickReplies(displayMessages) : { question: '', choices: [] };
     quickReplies = parsed;
-    if (parsed.choices.length > 0 && !cliPanel && !choiceDismissed) {
-      cliPanel = { type: 'choice', question: parsed.question, choices: parsed.choices };
-      cliPanelSelectedIndex = 0;
+    if (parsed.choices.length > 0 && !choiceDismissed) {
+      if (!cliPanel || cliPanel.type === 'plan-ready' || (cliPanel.type === 'choice' && cliPanel.question !== parsed.question)) {
+        cliPanel = { type: 'choice', question: parsed.question, choices: parsed.choices, showCustomInput: false, customText: '' };
+        cliPanelSelectedIndex = 0;
+      }
     } else if (parsed.choices.length === 0) {
       if (cliPanel?.type === 'choice') cliPanel = null;
       choiceDismissed = false; // reset when choices disappear (new messages arrive)
     }
+  }
+
+  // Auto-focus cliPanel when navigable choices appear
+  $: if (cliPanel && (cliPanel.type === 'choice' || cliPanel.type === 'model-select' || cliPanel.type === 'ask-user-question')) {
+    tick().then(() => cliPanelEl?.focus());
   }
 
   // Re-run search when messages change
@@ -440,6 +596,8 @@
           attachedFiles[last].lineRange = result.data.lineRange;
           attachedFiles = attachedFiles;
         }
+      } else if (result.type === 'plan-view') {
+        cliPanel = { type: 'plan-viewer', content: result.content };
       } else if (result.type === 'message') {
         showCliResult(result.content);
       }
@@ -466,12 +624,17 @@
 
   function closeCliPanel() {
     if (cliPanel?.type === 'choice') choiceDismissed = true;
+    if (cliPanel?.type === 'ask-user-question') {
+      // Clear pendingQuestion from streaming store to prevent reactive re-trigger
+      streamingStore.clear(tabId);
+    }
     cliPanel = null;
     cliPanelSelectedIndex = 0;
     if (cliPanelTimer) {
       clearTimeout(cliPanelTimer);
       cliPanelTimer = null;
     }
+    tick().then(() => textareaEl?.focus());
   }
 
   function autoCloseCliPanel(ms) {
@@ -495,12 +658,111 @@
 
   function selectChoice() {
     if (!cliPanel || cliPanel.type !== 'choice') return;
+    // "Other" option selected
+    if (cliPanelSelectedIndex === cliPanel.choices.length) {
+      cliPanel.showCustomInput = true;
+      cliPanel.customText = '';
+      cliPanel = cliPanel;
+      tick().then(() => {
+        const el = document.querySelector('.cli-custom-input');
+        if (el) el.focus();
+      });
+      return;
+    }
     const choice = cliPanel.choices[cliPanelSelectedIndex];
     if (!choice) return;
     cliPanel = null;
     quickReplies = { question: '', choices: [] };
-    inputMessage = choice.num + '. ' + choice.text;
-    tick().then(() => handleSend());
+    inputMessage = choice.num + ') ' + choice.text;
+    tick().then(() => {
+      textareaEl?.focus();
+      handleSend();
+    });
+  }
+
+  function submitChoiceCustom() {
+    if (!cliPanel || cliPanel.type !== 'choice') return;
+    const text = (cliPanel.customText || '').trim();
+    if (!text) return;
+    cliPanel = null;
+    quickReplies = { question: '', choices: [] };
+    inputMessage = text;
+    tick().then(() => {
+      textareaEl?.focus();
+      handleSend();
+    });
+  }
+
+  // --- AskUserQuestion handlers ---
+
+  function pickAskOption(idx) {
+    if (!cliPanel || cliPanel.type !== 'ask-user-question') return;
+    const q = cliPanel.questions[cliPanel.currentStep];
+    cliPanel.answers[q.question] = q.options[idx].label;
+    // Move to next question or enter review mode
+    if (cliPanel.currentStep < cliPanel.questions.length - 1) {
+      cliPanel.currentStep++;
+      cliPanel.selectedIndex = 0;
+    } else {
+      cliPanel.reviewing = true;
+    }
+    cliPanel = cliPanel; // trigger reactivity
+  }
+
+  function pickAskCustom() {
+    if (!cliPanel || cliPanel.type !== 'ask-user-question') return;
+    cliPanel.showCustomInput = true;
+    cliPanel.customText = '';
+    cliPanel = cliPanel; // trigger reactivity
+    tick().then(() => {
+      const el = document.querySelector('.ask-custom-input');
+      if (el) el.focus();
+    });
+  }
+
+  function submitCustomAnswer() {
+    if (!cliPanel || cliPanel.type !== 'ask-user-question') return;
+    const text = (cliPanel.customText || '').trim();
+    if (!text) return;
+    const q = cliPanel.questions[cliPanel.currentStep];
+    cliPanel.answers[q.question] = text;
+    cliPanel.showCustomInput = false;
+    cliPanel.customText = '';
+    // Move to next question or enter review mode
+    if (cliPanel.currentStep < cliPanel.questions.length - 1) {
+      cliPanel.currentStep++;
+      cliPanel.selectedIndex = 0;
+    } else {
+      cliPanel.reviewing = true;
+    }
+    cliPanel = cliPanel;
+  }
+
+  function allAskQuestionsAnswered() {
+    if (!cliPanel || cliPanel.type !== 'ask-user-question') return false;
+    return cliPanel.questions.every(q => cliPanel.answers[q.question]);
+  }
+
+  async function submitAskAnswers() {
+    if (!allAskQuestionsAnswered()) return;
+    const answers = { ...cliPanel.answers };
+    cliPanel = null;
+    streamingStore.clear(tabId);
+    sending = true;
+    autoScrollEnabled = true;
+    startStreamingTimer();
+    try {
+      await AnswerQuestion(tabId, answers);
+    } catch (e) {
+      errorMessage = String(e);
+    } finally {
+      sending = false;
+      stopStreamingTimer();
+      stopTypingEffect();
+      if (componentActive && !$streamingStore[tabId]?.pendingQuestion) {
+        streamingStore.clear(tabId);
+      }
+    }
   }
 
   async function handleSend() {
@@ -519,6 +781,7 @@
     // Clear stale streaming state before starting new send
     stopTypingEffect();
     streamingStore.clear(tabId);
+    cliPanel = null;  // Clear any existing AskUserQuestion panel
 
     sending = true;
     startStreamingTimer();
@@ -549,7 +812,16 @@
     // Cache image previews before clearing attachments
     cacheAttachedPreviews();
 
-    console.log('[ConversationTab] Sending message:', { tabId, message: messageToSend, files: filesToSend, adminMode });
+    console.log('[ConversationTab] Sending message:', { tabId, message: messageToSend, files: filesToSend, adminMode, teamsMode });
+
+    // 히스토리에 저장 (빈 메시지, 슬래시 명령은 제외 — 이미 early return됨)
+    if (trimmed) {
+      if (inputHistory.length === 0 || inputHistory[inputHistory.length - 1] !== trimmed) {
+        inputHistory = [...inputHistory, trimmed];
+      }
+    }
+    historyIndex = -1;
+    historySavedInput = '';
 
     inputMessage = ''; // Clear input immediately for better UX
     attachedFiles = []; // Clear attachments
@@ -564,7 +836,12 @@
     setTimeout(() => scrollToBottom(), 0);
 
     try {
-      if (adminMode) {
+      if (teamsMode) {
+        // Teams (Beta) mode: single CLI call with --agents
+        console.log('[ConversationTab] Calling SendTeamsMessage (teams)...');
+        await SendTeamsMessage(tabId, messageToSend, filesToSend);
+        console.log('[ConversationTab] Teams message completed');
+      } else if (adminMode) {
         // Admin mode: use orchestration flow
         console.log('[ConversationTab] Calling SendAdminMessage (orchestration)...');
         await SendAdminMessage(tabId, messageToSend, filesToSend);
@@ -587,7 +864,7 @@
       stopTypingEffect();
       // Only clear store if this component is still alive
       // (if destroyed, the new component may be using the store data)
-      if (componentActive) {
+      if (componentActive && !$streamingStore[tabId]?.pendingQuestion) {
         streamingStore.clear(tabId);
       }
     }
@@ -595,7 +872,10 @@
 
   async function handleCancel() {
     try {
-      if (adminMode) {
+      if (teamsMode) {
+        await CancelOrchestrationJob(tabId);
+        console.log('[ConversationTab] Teams orchestration cancelled');
+      } else if (adminMode) {
         await CancelOrchestrationJob(tabId);
         console.log('[ConversationTab] Orchestration cancelled');
       } else {
@@ -739,6 +1019,14 @@
     return p;
   }
 
+  function openLightbox(src) {
+    lightboxSrc = src;
+  }
+
+  function closeLightbox() {
+    lightboxSrc = null;
+  }
+
   // Cache attached file previews before sending so they're available for bubble display
   function cacheAttachedPreviews() {
     for (const file of attachedFiles) {
@@ -765,15 +1053,37 @@
     return { destroy() {} };
   }
 
+  async function requestCodeReview() {
+    try {
+      await RequestCodeReview(tabId);
+    } catch (e) {
+      console.error('Code review failed:', e);
+    }
+  }
+
   async function toggleAdminMode() {
     try {
       await ToggleTabAdminMode(tabId, adminMode);
+      // If enabling admin mode, disable teams mode
+      if (adminMode) teamsMode = false;
       // Refresh parent to update all tabs
       dispatch('refresh');
     } catch (error) {
       console.error('Failed to toggle admin mode:', error);
       // Revert on error
       adminMode = !adminMode;
+    }
+  }
+
+  async function toggleTeamsMode() {
+    try {
+      await ToggleTabTeamsMode(tabId, teamsMode);
+      // If enabling teams mode, disable admin mode
+      if (teamsMode) adminMode = false;
+      dispatch('refresh');
+    } catch (error) {
+      console.error('Failed to toggle teams mode:', error);
+      teamsMode = !teamsMode;
     }
   }
 
@@ -798,7 +1108,38 @@
     await handleSend();
   }
 
+  async function viewPlanFile() {
+    try {
+      const content = await GetPlanContent(tabId);
+      if (!content) {
+        showCliResult('이 세션에 플랜 파일이 아직 없습니다. Plan 모드에서 응답을 받은 후 다시 시도해주세요.');
+        return;
+      }
+      cliPanel = { type: 'plan-viewer', content };
+    } catch (error) {
+      showCliResult(`플랜 파일 로드 실패: ${error}`);
+    }
+  }
+
+  async function refreshPlanContent() {
+    try {
+      const content = await GetPlanContent(tabId);
+      if (!content) {
+        showCliResult('이 세션에 플랜 파일이 아직 없습니다. Plan 모드에서 응답을 받은 후 다시 시도해주세요.');
+        return;
+      }
+      cliPanel = { type: 'plan-viewer', content };
+    } catch (error) {
+      showCliResult(`플랜 파일 로드 실패: ${error}`);
+    }
+  }
+
   function handleInput() {
+    // 히스토리 탐색 중 직접 타이핑하면 탐색 모드 해제
+    if (historyIndex !== -1) {
+      historyIndex = -1;
+      historySavedInput = '';
+    }
     const trimmed = inputMessage.trim();
     if (trimmed.startsWith('/') && trimmed.length > 0) {
       const prefix = trimmed.substring(1).split(/\s/)[0];
@@ -973,6 +1314,7 @@
       }
       if (event.key === 'Enter' && !event.metaKey && !event.ctrlKey) {
         event.preventDefault();
+        event.stopPropagation();
         const item = filePopupItems[filePopupSelectedIndex];
         if (item.isDir) {
           navigateFileDir(item);
@@ -1012,6 +1354,7 @@
       }
       if (event.key === 'Enter' && !event.metaKey && !event.ctrlKey) {
         event.preventDefault();
+        event.stopPropagation();
         const cmd = popupCommands[popupSelectedIndex];
         inputMessage = `/${cmd.name} `;
         showPopup = false;
@@ -1032,6 +1375,42 @@
         popupCommands = [];
         return;
       }
+    }
+
+    // Input history navigation (ArrowUp/Down on empty textarea)
+    if (event.key === 'ArrowUp' && !showPopup && !showFilePopup && inputHistory.length > 0) {
+      const cursorPos = textareaEl.selectionStart;
+      const textBeforeCursor = inputMessage.substring(0, cursorPos);
+      if (textBeforeCursor.includes('\n')) return;
+
+      if (historyIndex === -1) {
+        historySavedInput = inputMessage;
+        historyIndex = inputHistory.length - 1;
+      } else if (historyIndex > 0) {
+        historyIndex--;
+      }
+      event.preventDefault();
+      inputMessage = inputHistory[historyIndex];
+      tick().then(() => textareaEl.setSelectionRange(inputMessage.length, inputMessage.length));
+      return;
+    }
+
+    if (event.key === 'ArrowDown' && !showPopup && !showFilePopup && historyIndex !== -1) {
+      const cursorPos = textareaEl.selectionStart;
+      const textAfterCursor = inputMessage.substring(cursorPos);
+      if (textAfterCursor.includes('\n')) return;
+
+      event.preventDefault();
+      if (historyIndex < inputHistory.length - 1) {
+        historyIndex++;
+        inputMessage = inputHistory[historyIndex];
+      } else {
+        historyIndex = -1;
+        inputMessage = historySavedInput;
+        historySavedInput = '';
+      }
+      tick().then(() => textareaEl.setSelectionRange(inputMessage.length, inputMessage.length));
+      return;
     }
   }
 
@@ -1162,6 +1541,8 @@
   }
 
   function handleWindowKeydown(event) {
+    // Only handle keyboard shortcuts if this tab has focus
+    if ($focusedTabId !== tabId) return;
     // In-page search shortcut (Cmd/Ctrl+F)
     if (event.key === 'f' && (isMac ? event.metaKey : event.ctrlKey) && !event.shiftKey) {
       event.preventDefault();
@@ -1173,6 +1554,11 @@
       closeSearch();
       return;
     }
+    if (lightboxSrc && event.key === 'Escape') {
+      event.preventDefault();
+      closeLightbox();
+      return;
+    }
 
     // CLI panel keyboard handling (highest priority)
     if (cliPanel) {
@@ -1182,20 +1568,110 @@
         executePlan();
         return;
       }
-      if (cliPanel.type === 'model-select' || cliPanel.type === 'choice') {
-        const items = cliPanel.type === 'model-select' ? cliPanel.models : cliPanel.choices;
+      if (cliPanel.type === 'ask-user-question' && cliPanel.showCustomInput) {
+        // Custom text input mode: only handle Escape to cancel
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          cliPanel.showCustomInput = false;
+          cliPanel = cliPanel;
+          return;
+        }
+        // Let all other keys (typing, Enter handled by input's on:keydown) pass through to the input
+        return;
+      }
+      if (cliPanel.type === 'ask-user-question' && !cliPanel.reviewing && !cliPanel.showCustomInput) {
+        const q = cliPanel.questions[cliPanel.currentStep];
+        const totalItems = q.options.length + 1; // +1 for "Other"
         if (event.key === 'ArrowDown') {
           event.preventDefault();
-          cliPanelSelectedIndex = (cliPanelSelectedIndex + 1) % items.length;
+          cliPanel.selectedIndex = (cliPanel.selectedIndex + 1) % totalItems;
+          cliPanel = cliPanel;
           return;
         }
         if (event.key === 'ArrowUp') {
           event.preventDefault();
-          cliPanelSelectedIndex = (cliPanelSelectedIndex - 1 + items.length) % items.length;
+          cliPanel.selectedIndex = (cliPanel.selectedIndex - 1 + totalItems) % totalItems;
+          cliPanel = cliPanel;
           return;
         }
         if (event.key === 'Enter' && !event.metaKey && !event.ctrlKey) {
           event.preventDefault();
+          if (cliPanel.selectedIndex === q.options.length) {
+            pickAskCustom();
+          } else {
+            pickAskOption(cliPanel.selectedIndex);
+          }
+          return;
+        }
+        if (event.key === 'ArrowLeft' && cliPanel.currentStep > 0) {
+          event.preventDefault();
+          cliPanel.currentStep--;
+          cliPanel.selectedIndex = 0;
+          cliPanel = cliPanel;
+          return;
+        }
+        if (event.key === 'ArrowRight' && cliPanel.currentStep < cliPanel.questions.length - 1 && cliPanel.answers[q.question]) {
+          event.preventDefault();
+          cliPanel.currentStep++;
+          cliPanel.selectedIndex = 0;
+          cliPanel = cliPanel;
+          return;
+        }
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          closeCliPanel();
+          return;
+        }
+        return; // consume all other keys while ask panel is open
+      }
+      if (cliPanel.type === 'ask-user-question' && cliPanel.reviewing) {
+        if (event.key === 'Enter' && !event.metaKey && !event.ctrlKey) {
+          event.preventDefault();
+          submitAskAnswers();
+          return;
+        }
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          cliPanel.reviewing = false;
+          cliPanel = cliPanel;
+          return;
+        }
+        return;
+      }
+      if (cliPanel.type === 'model-select' || cliPanel.type === 'choice') {
+        const items = cliPanel.type === 'model-select' ? cliPanel.models : cliPanel.choices;
+        const totalItems = cliPanel.type === 'choice' ? items.length + 1 : items.length; // +1 for "Other"
+
+        // 커스텀 입력 중이면 키보드를 입력 필드에 위임
+        if (cliPanel.type === 'choice' && cliPanel.showCustomInput) {
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            cliPanel.showCustomInput = false;
+            cliPanel = cliPanel;
+            return;
+          }
+          return; // 나머지 키는 input에 위임
+        }
+
+        // textarea에 포커스가 있으면 방향키는 textarea가 처리 (히스토리 탐색 등)
+        const textareaFocused = document.activeElement === textareaEl;
+        if (event.key === 'ArrowDown' && !textareaFocused) {
+          event.preventDefault();
+          cliPanelSelectedIndex = (cliPanelSelectedIndex + 1) % totalItems;
+          return;
+        }
+        if (event.key === 'ArrowUp' && !textareaFocused) {
+          event.preventDefault();
+          cliPanelSelectedIndex = (cliPanelSelectedIndex - 1 + totalItems) % totalItems;
+          return;
+        }
+        if (event.key === 'Enter' && !event.metaKey && !event.ctrlKey) {
+          event.preventDefault();
+          // If textarea has focus and content, send message instead of selecting choice
+          if (document.activeElement === textareaEl && inputMessage.trim()) {
+            handleSend();
+            return;
+          }
           if (cliPanel.type === 'model-select') {
             selectModel();
           } else if (cliPanel.type === 'choice') {
@@ -1209,8 +1685,8 @@
           return;
         }
       }
-      // result type: Esc dismisses
-      if (cliPanel.type === 'result') {
+      // result / plan-viewer type: Esc dismisses
+      if (cliPanel.type === 'result' || cliPanel.type === 'plan-viewer') {
         if (event.key === 'Escape') {
           event.preventDefault();
           closeCliPanel();
@@ -1250,6 +1726,8 @@
 <div class="conversation-tab"
      bind:this={conversationTabEl}
      class:drag-over={dragOver}
+     on:focusin={() => focusedTabId.set(tabId)}
+     on:mousedown={() => focusedTabId.set(tabId)}
      on:dragover={handleDragOver}
      on:dragleave={handleDragLeave}
      on:drop={handleDrop}>
@@ -1288,7 +1766,7 @@
                   {#if isImagePath(att)}
                     <div class="message-image-item">
                       {#if imagePreviewCache[att]}
-                        <img src={imagePreviewCache[att]} alt={att.split('/').pop()} class="bubble-image-thumb" />
+                        <img src={imagePreviewCache[att]} alt={att.split('/').pop()} class="bubble-image-thumb" on:click={() => openLightbox(imagePreviewCache[att])} />
                       {:else}
                         <div class="image-placeholder" use:loadImagePreview={att}>
                           {att.split('/').pop()}
@@ -1306,14 +1784,34 @@
               </div>
             {/if}
             <div class="message-content">
-              {#if message.role === 'assistant' || message.role === 'system'}
-                <MarkdownViewer content={message.content} />
-              {:else}
-                {message.content}
-              {/if}
+              <MarkdownViewer content={message.content} />
             </div>
-            {#if message.role === 'assistant' && message.durationMs}
-              <span class="msg-duration">{formatDuration(message.durationMs)}</span>
+            {#if message.role === 'assistant' && (message.durationMs || message.inputTokens)}
+              <span class="msg-duration">
+                {#if message.durationMs}{formatDuration(message.durationMs)}{/if}
+                {#if message.inputTokens}
+                  <span class="token-in" title="Input tokens">↑{formatTokens(message.inputTokens)}</span>
+                  <span class="token-out" title="Output tokens">↓{formatTokens(message.outputTokens)}</span>
+                {/if}
+              </span>
+            {/if}
+            {#if message.toolUses && message.toolUses.length > 0}
+              <button class="process-toggle-btn" on:click={() => toggleProcess(index)}>
+                ⚙️ 과정 보기 ({message.toolUses.length})
+                <span class="chevron" class:open={expandedProcessIndex === index}>▸</span>
+              </button>
+              {#if expandedProcessIndex === index}
+                <div class="process-details">
+                  {#each message.toolUses as tu, i}
+                    <div class="process-step">
+                      <span class="step-num">{i + 1}</span>
+                      <span class="step-icon">{getToolIcon(tu.toolName)}</span>
+                      <span class="step-name">{tu.toolName}</span>
+                      <span class="step-detail">{tu.detail}</span>
+                    </div>
+                  {/each}
+                </div>
+              {/if}
             {/if}
             {#if message.role === 'assistant'}
               <button class="msg-expand-btn" on:click={() => openExpandedView(message.content)} title="확대 보기">
@@ -1344,26 +1842,53 @@
         <div class="message assistant streaming">
           <div class="message-content">
             {#if typingContent}
-              <MarkdownViewer content={typingContent} />
+              <div class="streaming-content-wrapper" class:overflowing={streamingOverflowing} bind:this={streamingWrapperEl}>
+                <div class="streaming-content-fade"></div>
+                <div class="streaming-content-body" bind:this={streamingBodyEl}>
+                  <MarkdownViewer content={typingContent} />
+                </div>
+              </div>
               <div class="streaming-indicator">
                 <span class="streaming-dot"></span>
                 <span class="streaming-dot"></span>
                 <span class="streaming-dot"></span>
-                <span class="streaming-label">응답 생성 중...</span>
+                {#if toolActivity}
+                  <span class="streaming-tool-icon">{getToolIcon(toolActivity.toolName)}</span>
+                  <span class="streaming-label">{getToolLabel(toolActivity.toolName)} {toolActivity.detail}</span>
+                {:else}
+                  <span class="streaming-label">응답 생성 중...</span>
+                {/if}
                 <span class="streaming-elapsed">{formatElapsed(streamingElapsed)}</span>
+                {#if tokenUsage}
+                  <span class="streaming-tokens">
+                    <span class="token-in" title="Input tokens">↑{formatTokens(tokenUsage.inputTokens)}</span>
+                    <span class="token-out" title="Output tokens">↓{formatTokens(tokenUsage.outputTokens)}</span>
+                  </span>
+                {/if}
               </div>
             {:else}
               <div class="streaming-indicator waiting">
                 <span class="streaming-dot"></span>
                 <span class="streaming-dot"></span>
                 <span class="streaming-dot"></span>
-                <span class="streaming-label">응답 생성 중...</span>
+                {#if toolActivity}
+                  <span class="streaming-tool-icon">{getToolIcon(toolActivity.toolName)}</span>
+                  <span class="streaming-label">{getToolLabel(toolActivity.toolName)} {toolActivity.detail}</span>
+                {:else}
+                  <span class="streaming-label">응답 생성 중...</span>
+                {/if}
                 <span class="streaming-elapsed">{formatElapsed(streamingElapsed)}</span>
+                {#if tokenUsage}
+                  <span class="streaming-tokens">
+                    <span class="token-in" title="Input tokens">↑{formatTokens(tokenUsage.inputTokens)}</span>
+                    <span class="token-out" title="Output tokens">↓{formatTokens(tokenUsage.outputTokens)}</span>
+                  </span>
+                {/if}
               </div>
             {/if}
           </div>
           {#if typingContent}
-            <button class="msg-expand-btn" on:click={() => openExpandedView(typingContent)} title="확대 보기">
+            <button class="msg-expand-btn" on:click={() => openExpandedView(fullContent || typingContent)} title="확대 보기">
               <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor"><path d="M1.5 1h4a.5.5 0 010 1H2.707l3.147 3.146a.5.5 0 11-.708.708L2 2.707V5.5a.5.5 0 01-1 0v-4a.5.5 0 01.5-.5zm13 0a.5.5 0 01.5.5v4a.5.5 0 01-1 0V2.707l-3.146 3.147a.5.5 0 11-.708-.708L13.293 2H10.5a.5.5 0 010-1h4zm-13 14a.5.5 0 01-.5-.5v-4a.5.5 0 011 0v2.793l3.146-3.147a.5.5 0 11.708.708L2.707 14H5.5a.5.5 0 010 1h-4zm13 0h-4a.5.5 0 010-1h2.793l-3.147-3.146a.5.5 0 11.708-.708L14 13.293V10.5a.5.5 0 011 0v4a.5.5 0 01-.5.5z"/></svg>
             </button>
           {/if}
@@ -1381,7 +1906,7 @@
   {/if}
 
   {#if cliPanel}
-    <div class="cli-panel">
+    <div class="cli-panel" bind:this={cliPanelEl} tabindex="-1">
       {#if cliPanel.type === 'model-select'}
         <div class="cli-title">모델 선택</div>
         <div class="cli-options">
@@ -1414,8 +1939,95 @@
               <span class="cli-choice-text"><MarkdownViewer content={choice.text} /></span>
             </div>
           {/each}
+          <!-- Other (custom text) option -->
+          <div class="cli-option"
+               class:selected={cliPanelSelectedIndex === cliPanel.choices.length}
+               on:click={() => { cliPanelSelectedIndex = cliPanel.choices.length; selectChoice(); }}>
+            <span class="cli-cursor">{cliPanelSelectedIndex === cliPanel.choices.length ? '❯' : ' '}</span>
+            <span class="cli-choice-num">✎</span>
+            <span class="cli-choice-text">기타 (직접 입력)</span>
+          </div>
+          {#if cliPanel.showCustomInput}
+            <div class="ask-custom-row">
+              <input class="ask-custom-input cli-custom-input"
+                     bind:value={cliPanel.customText}
+                     on:keydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); submitChoiceCustom(); } }}
+                     placeholder="답변을 입력하세요..." />
+              <button class="ask-custom-submit" on:click={submitChoiceCustom}>OK</button>
+            </div>
+          {/if}
         </div>
         <div class="cli-hint">↑↓ 이동 · Enter 선택 · Esc 취소</div>
+      {:else if cliPanel.type === 'ask-user-question'}
+        <div class="ask-panel">
+          <div class="ask-progress">
+            {#each cliPanel.questions as q, i}
+              <span class="ask-step"
+                    class:done={cliPanel.answers[q.question]}
+                    class:current={i === cliPanel.currentStep}>
+                {q.header || `Q${i+1}`}
+              </span>
+            {/each}
+            <button class="ask-submit-tab"
+                    disabled={!allAskQuestionsAnswered()}
+                    on:click={submitAskAnswers}>
+              Submit
+            </button>
+          </div>
+
+          {#if !cliPanel.reviewing}
+            {@const q = cliPanel.questions[cliPanel.currentStep]}
+            <div class="ask-question-text">{q.question}</div>
+            <div class="cli-options">
+              {#each q.options as opt, i}
+                <div class="cli-option"
+                     class:selected={i === cliPanel.selectedIndex}
+                     on:click={() => pickAskOption(i)}>
+                  <span class="cli-cursor">{i === cliPanel.selectedIndex ? '❯' : ' '}</span>
+                  <div class="ask-opt-content">
+                    <span class="ask-opt-label">{opt.label}</span>
+                    {#if opt.description}
+                      <span class="ask-opt-desc">{opt.description}</span>
+                    {/if}
+                  </div>
+                </div>
+              {/each}
+              <!-- Other (custom text) option -->
+              <div class="cli-option"
+                   class:selected={cliPanel.selectedIndex === q.options.length}
+                   on:click={pickAskCustom}>
+                <span class="cli-cursor">{cliPanel.selectedIndex === q.options.length ? '❯' : ' '}</span>
+                <div class="ask-opt-content">
+                  <span class="ask-opt-label">Other</span>
+                  <span class="ask-opt-desc">Type a custom answer</span>
+                </div>
+              </div>
+              {#if cliPanel.showCustomInput}
+                <div class="ask-custom-row">
+                  <input class="ask-custom-input"
+                         bind:value={cliPanel.customText}
+                         on:keydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); submitCustomAnswer(); } }}
+                         placeholder="Enter your answer..." />
+                  <button class="ask-custom-submit" on:click={submitCustomAnswer}>OK</button>
+                </div>
+              {/if}
+            </div>
+            <div class="cli-hint">↑↓ 이동 · Enter 선택 · ← 이전 · → 다음</div>
+          {:else}
+            <div class="ask-review">
+              {#each cliPanel.questions as q}
+                <div class="ask-review-item">
+                  <span class="ask-review-q">{q.question}</span>
+                  <span class="ask-review-a">→ {cliPanel.answers[q.question]}</span>
+                </div>
+              {/each}
+            </div>
+            <div class="ask-actions">
+              <button class="ask-submit-btn" on:click={submitAskAnswers}>Submit answers</button>
+              <button class="ask-cancel-btn" on:click={() => { cliPanel.reviewing = false; cliPanel = cliPanel; }}>Back</button>
+            </div>
+          {/if}
+        </div>
       {:else if cliPanel.type === 'result'}
         <div class="cli-result-content">
           <MarkdownViewer content={cliPanel.content} />
@@ -1423,18 +2035,31 @@
       {:else if cliPanel.type === 'plan-ready'}
         <div class="cli-plan-ready">
           <span class="plan-ready-text">플랜이 준비되었습니다</span>
+          <button class="plan-view-btn" on:click={viewPlanFile}>플랜 파일 보기</button>
           <button class="plan-execute-btn" on:click={executePlan}>
             플랜 실행 <span class="shortcut-hint">{isMac ? '⌘' : 'Ctrl'}⇧↵</span>
           </button>
           <span class="plan-ready-hint">또는 추가 요청을 입력하세요</span>
         </div>
+      {:else if cliPanel.type === 'plan-viewer'}
+        <div class="cli-plan-viewer">
+          <div class="plan-viewer-header">
+            <span class="plan-viewer-title">Plan File</span>
+            <button class="plan-viewer-btn" on:click={refreshPlanContent}>↻</button>
+            <button class="plan-viewer-btn" on:click={() => OpenExpandedView(cliPanel.content)}>브라우저로 보기</button>
+            <button class="plan-viewer-btn" on:click={closeCliPanel}>✕</button>
+          </div>
+          <div class="plan-viewer-content">
+            <MarkdownViewer content={cliPanel.content} />
+          </div>
+        </div>
       {/if}
     </div>
   {/if}
 
-  {#if adminMode && orchestratorState && Object.keys(orchestratorState.tasks).length > 0}
+  {#if (adminMode || teamsMode) && orchestratorState && Object.keys(orchestratorState.tasks).length > 0}
     <div class="orchestrator-dashboard">
-      <div class="dashboard-title">워커 상태</div>
+      <div class="dashboard-title">{teamsMode ? 'Teams 에이전트 상태' : '워커 상태'}</div>
       <div class="dashboard-tasks">
         {#each Object.entries(orchestratorState.tasks) as [taskId, task]}
           <div class="task-card" class:running={task.status === 'running'} class:completed={task.status === 'completed'} class:failed={task.status === 'failed'}>
@@ -1489,6 +2114,14 @@
         />
         <span>관리자 모드</span>
       </label>
+      <label class="teams-mode-toggle" class:active={teamsMode}>
+        <input
+          type="checkbox"
+          bind:checked={teamsMode}
+          on:change={toggleTeamsMode}
+        />
+        <span>Teams (Beta)</span>
+      </label>
       <label class="plan-mode-toggle" class:active={planMode}>
         <input
           type="checkbox"
@@ -1501,6 +2134,9 @@
         📎 파일 첨부
       </button>
       {#if isGitRepo}
+        <button class="review-btn" on:click={requestCodeReview} title="AI 코드 리뷰">
+          리뷰
+        </button>
         <button class="commit-btn" on:click|stopPropagation title="Git Commit">
           Commit
         </button>
@@ -1558,6 +2194,13 @@
     </div>
   </div>
 </div>
+
+{#if lightboxSrc}
+  <div class="lightbox-overlay" on:click={closeLightbox}>
+    <img src={lightboxSrc} alt="enlarged" class="lightbox-img" on:click|stopPropagation />
+    <button class="lightbox-close" on:click={closeLightbox}>✕</button>
+  </div>
+{/if}
 
 <style>
   .conversation-tab {
@@ -1652,6 +2295,7 @@
     color: var(--text-primary);
     margin-left: auto;
     margin-right: 0;
+    padding: 6px 12px;
   }
 
   .message.assistant {
@@ -1734,6 +2378,31 @@
     font-size: 11px;
     color: var(--text-muted);
     margin-left: 4px;
+    max-width: 300px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .streaming-tool-icon {
+    font-size: 12px;
+    margin-left: 4px;
+  }
+
+  .streaming-tokens {
+    display: flex;
+    gap: 6px;
+    margin-left: 8px;
+    font-size: 10px;
+    font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+  }
+
+  .token-in {
+    color: #60a5fa;
+  }
+
+  .token-out {
+    color: #34d399;
   }
 
   .message-attachments {
@@ -1841,7 +2510,21 @@
   }
 
   .message.user .message-content {
-    white-space: pre-wrap;
+  }
+
+  .message.user .message-content :global(p) {
+    margin: 0;
+  }
+
+  .message.user .message-content :global(ol),
+  .message.user .message-content :global(ul) {
+    margin: 0;
+    padding-left: 0;
+    list-style-position: inside;
+  }
+
+  .message.user .message-content :global(li) {
+    margin: 0;
   }
 
   .error-banner {
@@ -1906,6 +2589,7 @@
     font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
     font-size: 13px;
     animation: cliSlideUp 0.15s ease-out;
+    outline: none;
   }
 
   @keyframes cliSlideUp {
@@ -2041,6 +2725,261 @@
     margin-left: auto;
   }
 
+  .plan-view-btn {
+    padding: 6px 12px;
+    background-color: transparent;
+    color: #a78bfa;
+    border: 1px solid #7c3aed;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background-color 0.2s;
+  }
+
+  .plan-view-btn:hover {
+    background-color: rgba(124, 58, 237, 0.15);
+  }
+
+  .cli-plan-viewer {
+    display: flex;
+    flex-direction: column;
+    max-height: 400px;
+    background-color: var(--bg-secondary, #1e1e2e);
+    border: 1px solid #7c3aed44;
+    border-radius: 8px;
+    padding: 12px;
+    box-shadow: 0 2px 12px rgba(124, 58, 237, 0.08);
+  }
+
+  .plan-viewer-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 4px 10px;
+    border-bottom: 1px solid #7c3aed33;
+    margin-bottom: 10px;
+  }
+
+  .plan-viewer-title {
+    color: #a78bfa;
+    font-size: 13px;
+    font-weight: 600;
+    flex: 1;
+  }
+
+  .plan-viewer-btn {
+    background: transparent;
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+
+  .plan-viewer-btn:hover {
+    background-color: rgba(124, 58, 237, 0.15);
+    border-color: #7c3aed66;
+    color: #a78bfa;
+  }
+
+  .plan-viewer-content {
+    overflow-y: auto;
+    flex: 1;
+    font-size: 13px;
+    line-height: 1.5;
+    padding: 4px;
+  }
+
+  /* AskUserQuestion panel styles */
+  .ask-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .ask-progress {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .ask-step {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 500;
+    background-color: var(--bg-hover);
+    color: var(--text-muted);
+    transition: all 0.15s;
+  }
+
+  .ask-step.current {
+    background-color: var(--accent-bg);
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .ask-step.done {
+    background-color: rgba(46, 125, 50, 0.15);
+    color: var(--success);
+  }
+
+  .ask-submit-tab {
+    margin-left: auto;
+    padding: 3px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--accent);
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .ask-submit-tab:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .ask-submit-tab:not(:disabled):hover {
+    background-color: var(--accent);
+    color: var(--text-inverse);
+  }
+
+  .ask-question-text {
+    color: var(--text-primary);
+    font-size: 13px;
+    font-weight: 500;
+    margin: 4px 0;
+  }
+
+  .ask-opt-content {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .ask-opt-label {
+    color: var(--text-primary);
+    font-weight: 500;
+  }
+
+  .ask-opt-desc {
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: 1.3;
+  }
+
+  .ask-custom-row {
+    display: flex;
+    gap: 6px;
+    padding: 4px 0 4px 24px;
+    align-items: center;
+  }
+
+  .ask-custom-input {
+    flex: 1;
+    padding: 6px 10px;
+    background-color: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    color: var(--text-primary);
+    font-size: 13px;
+    outline: none;
+  }
+
+  .ask-custom-input:focus {
+    border-color: var(--accent);
+  }
+
+  .ask-custom-submit {
+    padding: 6px 12px;
+    background-color: var(--accent);
+    color: var(--text-inverse);
+    border: none;
+    border-radius: 4px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .ask-custom-submit:hover {
+    filter: brightness(1.1);
+  }
+
+  .ask-review {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 0;
+  }
+
+  .ask-review-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 6px 8px;
+    border-radius: 4px;
+    background-color: var(--bg-hover);
+  }
+
+  .ask-review-q {
+    color: var(--text-muted);
+    font-size: 11px;
+  }
+
+  .ask-review-a {
+    color: var(--accent);
+    font-size: 13px;
+    font-weight: 500;
+  }
+
+  .ask-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 4px;
+  }
+
+  .ask-submit-btn {
+    padding: 6px 16px;
+    background-color: var(--accent);
+    color: var(--text-inverse);
+    border: none;
+    border-radius: 4px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background-color 0.15s;
+  }
+
+  .ask-submit-btn:hover {
+    filter: brightness(1.1);
+  }
+
+  .ask-cancel-btn {
+    padding: 6px 16px;
+    background: transparent;
+    color: var(--text-muted);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+    font-size: 13px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+
+  .ask-cancel-btn:hover {
+    background-color: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
   .input-splitter {
     height: 4px;
     background-color: var(--border-primary);
@@ -2118,6 +3057,31 @@
     accent-color: #7c3aed;
   }
 
+  .teams-mode-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--text-secondary);
+    font-size: 12px;
+    cursor: pointer;
+    user-select: none;
+    padding: 2px 8px;
+    border-radius: 4px;
+    transition: all 0.2s;
+  }
+
+  .teams-mode-toggle.active {
+    color: #0ea5e9;
+    background-color: rgba(14, 165, 233, 0.1);
+  }
+
+  .teams-mode-toggle input[type="checkbox"] {
+    width: 14px;
+    height: 14px;
+    cursor: pointer;
+    accent-color: #0ea5e9;
+  }
+
   .attach-btn {
     padding: 6px 12px;
     background-color: var(--bg-header);
@@ -2131,6 +3095,25 @@
 
   .attach-btn:hover {
     background-color: var(--bg-hover);
+  }
+
+  .review-btn {
+    padding: 6px 12px;
+    background: none;
+    border: 1px solid rgba(59, 130, 246, 0.4);
+    color: #3b82f6;
+    font-size: 12px;
+    font-weight: 600;
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.15s;
+    font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+  }
+
+  .review-btn:hover {
+    background-color: rgba(59, 130, 246, 0.1);
+    border-color: #3b82f6;
   }
 
   .commit-btn {
@@ -2418,6 +3401,40 @@
     background-color: var(--bg-message-assistant);
   }
 
+  /* --- Streaming content ellipsis (max-height + fade) --- */
+  .streaming-content-wrapper {
+    position: relative;
+    max-height: 300px;
+    overflow-y: scroll;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .streaming-content-wrapper::-webkit-scrollbar {
+    display: none;
+  }
+
+  .streaming-content-body {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .streaming-content-fade {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 60px;
+    background: linear-gradient(to bottom, var(--bg-message-assistant, #2d2d3f), transparent);
+    z-index: 1;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+
+  .streaming-content-wrapper.overflowing .streaming-content-fade {
+    opacity: 1;
+  }
+
   .message.assistant.completed {
     border-left: 3px solid #10b981;
   }
@@ -2437,14 +3454,70 @@
     font-weight: 600;
   }
 
+  /* --- Tool activity history (과정 보기) --- */
+  .process-toggle-btn {
+    font-size: 11px;
+    color: var(--text-secondary);
+    cursor: pointer;
+    background: none;
+    border: none;
+    padding: 2px 6px;
+    margin-top: 4px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .process-toggle-btn:hover { color: var(--text-primary); }
+
+  .chevron { display: inline-block; transition: transform 0.2s; }
+  .chevron.open { transform: rotate(90deg); }
+
+  .process-details {
+    margin-top: 6px;
+    padding: 8px;
+    background: var(--bg-tertiary);
+    border-radius: 6px;
+    font-size: 12px;
+    max-height: 300px;
+    overflow-y: auto;
+  }
+
+  .process-step {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 0;
+    border-bottom: 1px solid var(--border-primary);
+  }
+  .process-step:last-child { border-bottom: none; }
+
+  .step-num {
+    min-width: 20px;
+    text-align: center;
+    color: var(--text-tertiary);
+    font-size: 10px;
+  }
+  .step-name {
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .step-detail {
+    color: var(--text-secondary);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   /* --- Expand button on assistant messages --- */
   .message.assistant {
     position: relative;
   }
 
   .msg-duration {
-    display: block;
-    text-align: right;
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 6px;
     font-size: 11px;
     color: var(--text-muted);
     opacity: 0.6;
@@ -2697,6 +3770,52 @@
     background-color: var(--accent);
     color: var(--text-inverse);
     border-color: var(--accent);
+  }
+
+  /* Image lightbox */
+  .lightbox-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    background: rgba(0, 0, 0, 0.85);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 9999;
+    cursor: pointer;
+  }
+
+  .lightbox-img {
+    max-width: 90vw;
+    max-height: 90vh;
+    object-fit: contain;
+    border-radius: 8px;
+    cursor: default;
+    box-shadow: 0 4px 40px rgba(0, 0, 0, 0.5);
+  }
+
+  .lightbox-close {
+    position: absolute;
+    top: 16px;
+    right: 24px;
+    background: rgba(255, 255, 255, 0.15);
+    border: none;
+    color: #fff;
+    font-size: 20px;
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.2s;
+  }
+
+  .lightbox-close:hover {
+    background: rgba(255, 255, 255, 0.3);
   }
 
 </style>

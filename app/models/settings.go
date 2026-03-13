@@ -5,6 +5,7 @@ type GlobalSettings struct {
 	PlanModeDefault bool            `json:"planModeDefault"` // Default plan mode checkbox state
 	AdminMode       bool            `json:"adminMode"`       // Admin mode toggle
 	TabSettings     map[string]bool `json:"tabSettings"`     // Per-tab settings (tab ID -> enabled)
+	AgentModel      string          `json:"agentModel"`      // Model for background agent tasks (default: haiku)
 }
 
 // FileInfo represents file attachment information

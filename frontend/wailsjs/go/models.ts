@@ -1,3 +1,30 @@
+export namespace claude {
+	
+	export class SessionInfo {
+	    sessionId: string;
+	    timestamp: string;
+	    lastActivity: string;
+	    preview: string;
+	    messageCount: number;
+	    projectPath: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new SessionInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.sessionId = source["sessionId"];
+	        this.timestamp = source["timestamp"];
+	        this.lastActivity = source["lastActivity"];
+	        this.preview = source["preview"];
+	        this.messageCount = source["messageCount"];
+	        this.projectPath = source["projectPath"];
+	    }
+	}
+
+}
+
 export namespace main {
 	
 	export class AutoContextFile {
@@ -18,6 +45,58 @@ export namespace main {
 	        this.exists = source["exists"];
 	    }
 	}
+	export class ReleaseNote {
+	    version: string;
+	    publishedAt: string;
+	    body: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new ReleaseNote(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.version = source["version"];
+	        this.publishedAt = source["publishedAt"];
+	        this.body = source["body"];
+	    }
+	}
+	export class UpdateInfo {
+	    currentVersion: string;
+	    latestVersion: string;
+	    updateAvailable: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new UpdateInfo(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.currentVersion = source["currentVersion"];
+	        this.latestVersion = source["latestVersion"];
+	        this.updateAvailable = source["updateAvailable"];
+	    }
+	}
+	export class UpdateResult {
+	    success: boolean;
+	    output: string;
+	    error: string;
+	    newVersion: string;
+	    installMethod: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new UpdateResult(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.success = source["success"];
+	        this.output = source["output"];
+	        this.error = source["error"];
+	        this.newVersion = source["newVersion"];
+	        this.installMethod = source["installMethod"];
+	    }
+	}
 
 }
 
@@ -27,6 +106,7 @@ export namespace models {
 	    planModeDefault: boolean;
 	    adminMode: boolean;
 	    tabSettings: Record<string, boolean>;
+	    agentModel: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new GlobalSettings(source);
@@ -37,6 +117,21 @@ export namespace models {
 	        this.planModeDefault = source["planModeDefault"];
 	        this.adminMode = source["adminMode"];
 	        this.tabSettings = source["tabSettings"];
+	        this.agentModel = source["agentModel"];
+	    }
+	}
+	export class ToolUse {
+	    toolName: string;
+	    detail: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new ToolUse(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.toolName = source["toolName"];
+	        this.detail = source["detail"];
 	    }
 	}
 	export class Message {
@@ -45,6 +140,9 @@ export namespace models {
 	    attachments: string[];
 	    timestamp: number;
 	    durationMs?: number;
+	    inputTokens?: number;
+	    outputTokens?: number;
+	    toolUses?: ToolUse[];
 	    metadata?: Record<string, string>;
 	
 	    static createFrom(source: any = {}) {
@@ -58,8 +156,29 @@ export namespace models {
 	        this.attachments = source["attachments"];
 	        this.timestamp = source["timestamp"];
 	        this.durationMs = source["durationMs"];
+	        this.inputTokens = source["inputTokens"];
+	        this.outputTokens = source["outputTokens"];
+	        this.toolUses = this.convertValues(source["toolUses"], ToolUse);
 	        this.metadata = source["metadata"];
 	    }
+	
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
 	}
 	export class WorkerTask {
 	    id: string;
@@ -187,6 +306,22 @@ export namespace models {
 		    return a;
 		}
 	}
+	export class TeamsState {
+	    connectedTabs: string[];
+	    agentMapping?: Record<string, string>;
+	    isRunning: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new TeamsState(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.connectedTabs = source["connectedTabs"];
+	        this.agentMapping = source["agentMapping"];
+	        this.isRunning = source["isRunning"];
+	    }
+	}
 	export class TabState {
 	    id: string;
 	    name: string;
@@ -195,7 +330,9 @@ export namespace models {
 	    isActive: boolean;
 	    adminMode: boolean;
 	    planMode: boolean;
+	    teamsMode: boolean;
 	    orchestrator?: OrchestratorState;
+	    teamsState?: TeamsState;
 	    workDir: string;
 	    contextFiles: string[];
 	
@@ -212,7 +349,9 @@ export namespace models {
 	        this.isActive = source["isActive"];
 	        this.adminMode = source["adminMode"];
 	        this.planMode = source["planMode"];
+	        this.teamsMode = source["teamsMode"];
 	        this.orchestrator = this.convertValues(source["orchestrator"], OrchestratorState);
+	        this.teamsState = this.convertValues(source["teamsState"], TeamsState);
 	        this.workDir = source["workDir"];
 	        this.contextFiles = source["contextFiles"];
 	    }
@@ -235,6 +374,8 @@ export namespace models {
 		    return a;
 		}
 	}
+	
+	
 	export class UsageInfo {
 	    inputTokens: number;
 	    outputTokens: number;

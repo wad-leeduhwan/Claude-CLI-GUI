@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import DynamicSplitLayout from './lib/components/DynamicSplitLayout.svelte'
   import { theme } from './lib/stores/theme.js';
+  import { fontSize } from './lib/stores/fontSize.js';
 
   // Apply theme to document element reactively
   $: {
@@ -9,8 +10,31 @@
       document.documentElement.setAttribute('data-theme', $theme);
     }
   }
+
+  // Apply zoom level to body reactively (px 단위도 스케일됨)
+  $: {
+    if (typeof document !== 'undefined') {
+      document.body.style.zoom = $fontSize / 100;
+    }
+  }
+
+  function handleKeydown(event) {
+    const mod = navigator.platform.toUpperCase().includes('MAC') ? event.metaKey : event.ctrlKey;
+    if (!mod) return;
+    if (event.key === '=' || event.key === '+') {
+      event.preventDefault();
+      fontSize.increase();
+    } else if (event.key === '-') {
+      event.preventDefault();
+      fontSize.decrease();
+    } else if (event.key === '0') {
+      event.preventDefault();
+      fontSize.reset();
+    }
+  }
 </script>
 
+<svelte:window on:keydown={handleKeydown} />
 <DynamicSplitLayout />
 
 <style>

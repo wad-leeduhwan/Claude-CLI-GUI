@@ -53,6 +53,17 @@ func NewAPIClient() *APIClient {
 		}
 	}
 
+	// Try ANTHROPIC_API_KEY (standard SDK env var)
+	authToken = os.Getenv("ANTHROPIC_API_KEY")
+	if authToken != "" {
+		fmt.Println("[APIClient] Using ANTHROPIC_API_KEY from environment")
+		return &APIClient{
+			baseURL:    baseURL,
+			authToken:  authToken,
+			httpClient: &http.Client{},
+		}
+	}
+
 	// Fallback to ANTHROPIC_AUTH_TOKEN
 	authToken = os.Getenv("ANTHROPIC_AUTH_TOKEN")
 	if authToken != "" {
@@ -104,10 +115,13 @@ type CreateMessageRequest struct {
 	Stream    bool      `json:"stream"`
 }
 
-// ContentBlock represents a content block in the response
+// ContentBlock represents a content block in a Claude message (text or tool_use)
 type ContentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type  string          `json:"type"`            // "text" | "tool_use"
+	Text  string          `json:"text,omitempty"`
+	ID    string          `json:"id,omitempty"`    // tool_use block ID
+	Name  string          `json:"name,omitempty"`  // tool name, e.g. "AskUserQuestion"
+	Input json.RawMessage `json:"input,omitempty"` // tool input (raw JSON)
 }
 
 // CreateMessageResponse is the response from creating a message

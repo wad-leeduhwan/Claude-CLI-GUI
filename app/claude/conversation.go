@@ -119,13 +119,15 @@ func (cm *ConversationManager) ClearConversation(conversationID string) {
 	delete(cm.conversations, conversationID)
 }
 
-// SendMessage sends a message to Claude and returns the response and turn count.
+// SendMessage sends a message to Claude and returns the response, turn count, and optional pending question.
 // Turn count tracks how many agentic turns (tool-use cycles) were used. Returns 0 for API mode.
-func (s *Service) SendMessage(ctx context.Context, conversationID, message string, files []string, workDir string, maxTurns int, systemPrompt string, permissionMode string, tools string, onChunk func(string)) (string, int, error) {
+// If Claude invokes AskUserQuestion, the pending question data is returned for interactive handling.
+// The agents parameter, when non-empty, enables sub-agent delegation via --agents CLI flag.
+func (s *Service) SendMessage(ctx context.Context, conversationID, message string, files []string, workDir string, maxTurns int, systemPrompt string, permissionMode string, tools string, agents string, onChunk func(string), onToolActivity func(string, string), onUsage func(int, int)) (string, int, *AskUserQuestionData, error) {
 	// Validate file sizes (10MB max per file)
 	for _, filePath := range files {
 		if err := utils.ValidateFile(filePath, 10); err != nil {
-			return "", 0, fmt.Errorf("file validation failed: %w", err)
+			return "", 0, nil, fmt.Errorf("file validation failed: %w", err)
 		}
 	}
 
@@ -149,23 +151,23 @@ func (s *Service) SendMessage(ctx context.Context, conversationID, message strin
 
 		response, err := s.apiClient.CreateMessage(ctx, messages, true, s.GetModel(), onChunk)
 		if err != nil {
-			return "", 0, fmt.Errorf("failed to get response from Anthropic API: %w", err)
+			return "", 0, nil, fmt.Errorf("failed to get response from Anthropic API: %w", err)
 		}
 
 		fmt.Printf("[Service] Response received from Anthropic API (length: %d)\n", len(response))
-		return response, 0, nil
+		return response, 0, nil, nil
 	}
 
 	// Fallback to CLI wrapper (no real-time streaming)
 	fmt.Printf("[Service] Sending message via Claude CLI (conversation: %s, model: %s, maxTurns: %d)\n", conversationID, s.GetModel(), maxTurns)
 
-	response, turnCount, err := s.cliWrapper.SendMessage(ctx, conversationID, message, files, s.GetModel(), workDir, maxTurns, systemPrompt, permissionMode, tools, onChunk)
+	response, turnCount, pendingQ, err := s.cliWrapper.SendMessage(ctx, conversationID, message, files, s.GetModel(), workDir, maxTurns, systemPrompt, permissionMode, tools, agents, onChunk, onToolActivity, onUsage)
 	if err != nil {
-		return "", turnCount, fmt.Errorf("failed to get response from Claude: %w", err)
+		return "", turnCount, nil, fmt.Errorf("failed to get response from Claude: %w", err)
 	}
 
-	fmt.Printf("[Service] Response received from Claude CLI (length: %d, turns: %d)\n", len(response), turnCount)
-	return response, turnCount, nil
+	fmt.Printf("[Service] Response received from Claude CLI (length: %d, turns: %d, pendingQuestion: %v)\n", len(response), turnCount, pendingQ != nil)
+	return response, turnCount, pendingQ, nil
 }
 
 // parseConversationContext parses the conversation context string into API messages

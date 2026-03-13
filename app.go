@@ -4,10 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +19,7 @@ import (
 
 	"claude-gui/app/claude"
 	"claude-gui/app/models"
+	"claude-gui/app/persistence"
 	"claude-gui/app/utils"
 	"claude-gui/app/websocket"
 
@@ -23,9 +28,16 @@ import (
 
 // Allowed models list
 var allowedModels = []string{
-	"claude-sonnet-4-20250514",
-	"claude-haiku-4-20250414",
-	"claude-opus-4-20250514",
+	"claude-sonnet-4-5-20250929",
+	"claude-haiku-4-5-20251001",
+	"claude-opus-4-6",
+}
+
+// UpdateInfo holds version comparison result for the frontend
+type UpdateInfo struct {
+	CurrentVersion  string `json:"currentVersion"`
+	LatestVersion   string `json:"latestVersion"`
+	UpdateAvailable bool   `json:"updateAvailable"`
 }
 
 // App struct
@@ -40,10 +52,15 @@ type App struct {
 	cancelFuncs         map[string]context.CancelFunc
 	cancelMu            sync.Mutex
 	orchestrationCancel map[string]context.CancelFunc
+	store               *persistence.Store
+	version             string
+	buildDate           string
+	agentService        *claude.AgentService
+	cachedReleaseNotes  []ReleaseNote
 }
 
 // NewApp creates a new App application struct
-func NewApp() *App {
+func NewApp(version, buildDate string) *App {
 	return &App{
 		tabs: make(map[string]*models.TabState),
 		settings: &models.GlobalSettings{
@@ -55,6 +72,9 @@ func NewApp() *App {
 		model:               "claude-sonnet-4-20250514",
 		cancelFuncs:         make(map[string]context.CancelFunc),
 		orchestrationCancel: make(map[string]context.CancelFunc),
+		store:               persistence.NewStore(), // nil on failure (graceful degradation)
+		version:             version,
+		buildDate:           buildDate,
 	}
 }
 
@@ -80,19 +100,56 @@ func (a *App) startup(ctx context.Context) {
 		fmt.Printf("Failed to start WebSocket server: %v\n", err)
 	}
 
-	homeDir, _ := os.UserHomeDir()
+	// Try to restore previous state
+	restored := false
+	if a.store != nil {
+		if state, err := a.store.Load(); err == nil && state != nil && len(state.Tabs) > 0 {
+			for _, tab := range state.Tabs {
+				tab.Orchestrator = nil // ephemeral, not restored
+				tab.TeamsState = nil   // ephemeral, not restored
+				if tab.Messages == nil {
+					tab.Messages = []models.Message{}
+				}
+				if tab.ContextFiles == nil {
+					tab.ContextFiles = []string{}
+				}
+				a.tabs[tab.ID] = tab
+			}
+			if state.Settings != nil {
+				if state.Settings.TabSettings == nil {
+					state.Settings.TabSettings = make(map[string]bool)
+				}
+				a.settings = state.Settings
+			}
+			if state.Model != "" {
+				a.model = state.Model
+			}
+			// Restore CLI session mappings
+			if len(state.SessionMappings) > 0 {
+				cliMappings := make(map[string]claude.SessionState, len(state.SessionMappings))
+				for k, v := range state.SessionMappings {
+					cliMappings[k] = claude.SessionState{
+						SessionID: v.SessionID,
+						Started:   v.Started,
+					}
+				}
+				a.claude.ImportSessions(cliMappings)
+			}
+			restored = true
+			fmt.Printf("[App.startup] Restored %d tabs from state.json\n", len(state.Tabs))
+		}
+	}
 
-	// Initialize 1 conversation tab
-	for i := 1; i <= 1; i++ {
-		tabID := fmt.Sprintf("conversation-%d", i)
+	if !restored {
+		homeDir, _ := os.UserHomeDir()
+		tabID := "conversation-1"
 		a.tabs[tabID] = &models.TabState{
 			ID:       tabID,
-			Name:     fmt.Sprintf("대화 %d", i),
+			Name:     "대화 1",
 			Messages: []models.Message{},
 			IsActive: false,
 			WorkDir:  homeDir,
 		}
-		// Initialize tab settings
 		a.settings.TabSettings[tabID] = false
 	}
 
@@ -109,11 +166,29 @@ func (a *App) startup(ctx context.Context) {
 			fmt.Println("Claude service initialized successfully")
 		}
 	}()
+
+	// Initialize background agent service
+	agentModel := a.settings.AgentModel
+	if agentModel == "" {
+		agentModel = "claude-haiku-4-5-20251001"
+		a.settings.AgentModel = agentModel
+	}
+	a.agentService = claude.NewAgentService(a.claude, agentModel)
+	a.agentService.OnResult = a.handleAgentResult
+	a.agentService.Start(2)
 }
 
 // GetWebSocketPort returns the WebSocket server port for frontend connection
 func (a *App) GetWebSocketPort() int {
 	return a.wsServer.GetPort()
+}
+
+// GetAppVersion returns the app build version string
+func (a *App) GetAppVersion() string {
+	if a.version == "dev" {
+		return "dev"
+	}
+	return fmt.Sprintf("%s (%s)", a.version, a.buildDate)
 }
 
 // GetClaudeVersion returns the installed Claude CLI version string
@@ -125,6 +200,300 @@ func (a *App) GetClaudeVersion() string {
 		return "unknown"
 	}
 	return strings.TrimSpace(string(out))
+}
+
+// extractVersion extracts a semver string (e.g. "1.0.23") from claude --version output.
+// The output may be just "1.0.23" or "claude-code 1.0.23".
+func extractVersion(raw string) string {
+	re := regexp.MustCompile(`(\d+\.\d+\.\d+)`)
+	match := re.FindString(strings.TrimSpace(raw))
+	return match
+}
+
+// compareSemver returns true if current < latest (i.e. update available).
+func compareSemver(current, latest string) bool {
+	parseParts := func(v string) (int, int, int) {
+		parts := strings.SplitN(v, ".", 3)
+		if len(parts) != 3 {
+			return 0, 0, 0
+		}
+		major, _ := strconv.Atoi(parts[0])
+		minor, _ := strconv.Atoi(parts[1])
+		patch, _ := strconv.Atoi(parts[2])
+		return major, minor, patch
+	}
+
+	cMajor, cMinor, cPatch := parseParts(current)
+	lMajor, lMinor, lPatch := parseParts(latest)
+
+	if cMajor != lMajor {
+		return cMajor < lMajor
+	}
+	if cMinor != lMinor {
+		return cMinor < lMinor
+	}
+	return cPatch < lPatch
+}
+
+// CheckForUpdate checks the current Claude CLI version against the latest on npm.
+// Returns UpdateInfo with version details. On any error, returns UpdateAvailable: false.
+func (a *App) CheckForUpdate() UpdateInfo {
+	// 1. Get current version
+	cmd := exec.Command("claude", "--version")
+	cmd.Env = claude.EnrichedEnv()
+	out, err := cmd.Output()
+	if err != nil {
+		return UpdateInfo{CurrentVersion: "unknown", UpdateAvailable: false}
+	}
+	currentVersion := extractVersion(string(out))
+	if currentVersion == "" {
+		return UpdateInfo{CurrentVersion: strings.TrimSpace(string(out)), UpdateAvailable: false}
+	}
+
+	// 2. Fetch latest version from npm registry
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get("https://registry.npmjs.org/@anthropic-ai/claude-code/latest")
+	if err != nil {
+		return UpdateInfo{CurrentVersion: currentVersion, UpdateAvailable: false}
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return UpdateInfo{CurrentVersion: currentVersion, UpdateAvailable: false}
+	}
+
+	var npmResult struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(body, &npmResult); err != nil {
+		return UpdateInfo{CurrentVersion: currentVersion, UpdateAvailable: false}
+	}
+
+	latestVersion := extractVersion(npmResult.Version)
+	if latestVersion == "" {
+		return UpdateInfo{CurrentVersion: currentVersion, UpdateAvailable: false}
+	}
+
+	// 3. Compare
+	updateAvailable := compareSemver(currentVersion, latestVersion)
+
+	return UpdateInfo{
+		CurrentVersion:  currentVersion,
+		LatestVersion:   latestVersion,
+		UpdateAvailable: updateAvailable,
+	}
+}
+
+// ReleaseNote holds a single release note entry from GitHub Releases
+type ReleaseNote struct {
+	Version     string `json:"version"`
+	PublishedAt string `json:"publishedAt"`
+	Body        string `json:"body"`
+}
+
+// GetReleaseNotes fetches release notes from the Claude Code changelog page
+// for versions between currentVersion (exclusive) and latestVersion (inclusive).
+func (a *App) GetReleaseNotes(currentVersion, latestVersion string) []ReleaseNote {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get("https://code.claude.com/docs/en/changelog")
+	if err != nil {
+		return []ReleaseNote{}
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return []ReleaseNote{}
+	}
+
+	html := string(body)
+
+	// Parse changelog: split by <h2> tags to get version sections
+	h2Re := regexp.MustCompile(`(?i)<h2[^>]*>([\d]+\.[\d]+\.[\d]+)</h2>`)
+	h2Matches := h2Re.FindAllStringSubmatchIndex(html, -1)
+
+	var notes []ReleaseNote
+	for i, match := range h2Matches {
+		ver := html[match[2]:match[3]]
+
+		// Filter: current < ver <= latest
+		if !compareSemver(currentVersion, ver) || compareSemver(latestVersion, ver) {
+			continue
+		}
+
+		// Extract the section between this <h2> and the next <h2>
+		sectionStart := match[1]
+		sectionEnd := len(html)
+		if i+1 < len(h2Matches) {
+			sectionEnd = h2Matches[i+1][0]
+		}
+		section := html[sectionStart:sectionEnd]
+
+		// Extract <li> contents
+		liRe := regexp.MustCompile(`(?i)<li[^>]*>(.*?)</li>`)
+		liMatches := liRe.FindAllStringSubmatch(section, -1)
+
+		var lines []string
+		for _, li := range liMatches {
+			text := stripHTMLTags(li[1])
+			text = strings.TrimSpace(text)
+			if text != "" {
+				lines = append(lines, "- "+text)
+			}
+		}
+
+		notes = append(notes, ReleaseNote{
+			Version: ver,
+			Body:    strings.Join(lines, "\n"),
+		})
+	}
+
+	// Sort descending by version (latest first)
+	sort.Slice(notes, func(i, j int) bool {
+		return compareSemver(notes[j].Version, notes[i].Version)
+	})
+
+	if notes == nil {
+		return []ReleaseNote{}
+	}
+	a.cachedReleaseNotes = notes
+	return notes
+}
+
+// OpenChangelogPage opens the Claude Code changelog page in the default browser.
+func (a *App) OpenChangelogPage() {
+	runtime.BrowserOpenURL(a.ctx, "https://code.claude.com/docs/en/changelog")
+}
+
+// TranslateReleaseNotes translates cached release note bodies to Korean
+// using the Claude CLI (one-shot --print mode). On failure, the original notes are returned.
+func (a *App) TranslateReleaseNotes() []ReleaseNote {
+	notes := a.cachedReleaseNotes
+	if len(notes) == 0 {
+		return notes
+	}
+
+	// Build a single prompt with all note bodies separated by ---
+	var parts []string
+	for _, n := range notes {
+		parts = append(parts, n.Body)
+	}
+	combined := strings.Join(parts, "\n---\n")
+
+	prompt := fmt.Sprintf("Translate the following release notes to Korean. Keep the `- ` bullet format exactly. Separate each version block with `---` on its own line. Do not add any extra text or explanation.\n\n%s", combined)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "claude", "--print", "--model", "claude-haiku-4-5-20251001", "--max-turns", "1", prompt)
+	cmd.Env = claude.EnrichedEnv()
+
+	out, err := cmd.Output()
+	if err != nil {
+		fmt.Printf("[TranslateReleaseNotes] CLI translation failed: %v\n", err)
+		return notes
+	}
+
+	result := strings.TrimSpace(string(out))
+	if result == "" {
+		return notes
+	}
+
+	// Split response by --- and map back to notes
+	translated := strings.Split(result, "---")
+
+	ret := make([]ReleaseNote, len(notes))
+	copy(ret, notes)
+	for i := range ret {
+		if i < len(translated) {
+			body := strings.TrimSpace(translated[i])
+			if body != "" {
+				ret[i].Body = body
+			}
+		}
+	}
+
+	return ret
+}
+
+// stripHTMLTags removes all HTML tags from a string, preserving text content.
+func stripHTMLTags(s string) string {
+	tagRe := regexp.MustCompile(`<[^>]*>`)
+	result := tagRe.ReplaceAllString(s, "")
+	// Decode common HTML entities
+	result = strings.ReplaceAll(result, "&amp;", "&")
+	result = strings.ReplaceAll(result, "&lt;", "<")
+	result = strings.ReplaceAll(result, "&gt;", ">")
+	result = strings.ReplaceAll(result, "&quot;", "\"")
+	result = strings.ReplaceAll(result, "&#39;", "'")
+	return result
+}
+
+// UpdateResult holds the result of an auto-update attempt
+type UpdateResult struct {
+	Success       bool   `json:"success"`
+	Output        string `json:"output"`
+	Error         string `json:"error"`
+	NewVersion    string `json:"newVersion"`
+	InstallMethod string `json:"installMethod"`
+}
+
+// DetectInstallMethod detects whether Claude CLI was installed via npm or Homebrew.
+func (a *App) DetectInstallMethod() string {
+	cmd := exec.Command("which", "claude")
+	cmd.Env = claude.EnrichedEnv()
+	out, err := cmd.Output()
+	if err != nil {
+		return "unknown"
+	}
+	path := strings.TrimSpace(string(out))
+	if strings.Contains(path, "homebrew") || strings.Contains(path, "Cellar") {
+		return "brew"
+	}
+	return "npm"
+}
+
+// UpdateClaude performs an automatic update of the Claude CLI.
+func (a *App) UpdateClaude() UpdateResult {
+	method := a.DetectInstallMethod()
+
+	var cmd *exec.Cmd
+	switch method {
+	case "brew":
+		cmd = exec.Command("brew", "upgrade", "claude-code")
+	case "npm":
+		cmd = exec.Command("npm", "install", "-g", "@anthropic-ai/claude-code")
+	default:
+		return UpdateResult{
+			Success:       false,
+			Error:         "설치 방법을 감지할 수 없습니다",
+			InstallMethod: method,
+		}
+	}
+
+	cmd.Env = claude.EnrichedEnv()
+	out, err := cmd.CombinedOutput()
+	output := string(out)
+
+	if err != nil {
+		return UpdateResult{
+			Success:       false,
+			Output:        output,
+			Error:         err.Error(),
+			InstallMethod: method,
+		}
+	}
+
+	// Get the new version after update
+	newVersion := a.GetClaudeVersion()
+
+	return UpdateResult{
+		Success:       true,
+		Output:        output,
+		NewVersion:    newVersion,
+		InstallMethod: method,
+	}
 }
 
 // GetTabs returns all tab states
@@ -164,7 +533,7 @@ func (a *App) GetSettings() models.GlobalSettings {
 // UpdateSettings updates the global settings
 func (a *App) UpdateSettings(settings models.GlobalSettings) error {
 	a.settings = &settings
-	// TODO: Persist settings to disk
+	go a.saveState()
 	return nil
 }
 
@@ -232,16 +601,18 @@ func (a *App) SendMessage(tabID, message string, files []string) error {
 	permissionMode := "bypassPermissions"
 
 	// Base system prompt for GUI environment
-	guiContext := "You are running inside a GUI chat application (not an interactive terminal). " +
-		"You CANNOT ask interactive questions mid-execution. If you need clarification or user input, STOP and ask in your response text. " +
-		"If the user's request is ambiguous, ask clarifying questions BEFORE taking action. " +
-		"Present options and wait for the user's choice when multiple approaches are possible. " +
+	guiContext := "You are running inside a GUI chat application. " +
+		"IMPORTANT: When you need to ask the user a question, clarify requirements, or let the user choose between approaches, " +
+		"you MUST ALWAYS use the AskUserQuestion tool. NEVER output questions as plain numbered lists or bullet points in plain text. " +
+		"The GUI renders AskUserQuestion as an interactive selection UI with clickable options. " +
+		"If the user's request is ambiguous or multiple approaches are possible, use AskUserQuestion BEFORE taking action. " +
 		"The user will respond in the next message."
 
 	var systemPrompt string
 	var tools string // empty = all tools (default)
 
 	if tab.PlanMode {
+		permissionMode = "plan"
 		systemPrompt = guiContext + "\n\n[PLAN MODE] You are in read-only plan mode. You MUST NOT modify any files.\n" +
 			"Follow this workflow thoroughly:\n\n" +
 			"1. EXPLORE PHASE: Use Task tool with subagent_type='Explore' to deeply analyze the codebase. " +
@@ -302,20 +673,26 @@ func (a *App) SendMessage(tabID, message string, files []string) error {
 	// Send full conversation context to Claude CLI with streaming callback
 	var streamingContent string
 	var chunkCount int
+	var lastInputTokens, lastOutputTokens int
+	var toolUses []models.ToolUse
 	sendStartTime := time.Now()
 
-	maxTurns := 0 // 0 = unlimited
-	if tab.PlanMode {
-		maxTurns = 100 // Plan mode: enough turns to thoroughly analyze codebase
-	}
+	maxTurns := 0 // 0 = unlimited — stall timeout + manual cancel로 충분
 
-	response, turnCount, err := a.claude.SendMessage(ctx, tabID, messageToSend, files, tab.WorkDir, maxTurns, systemPrompt, permissionMode, tools, func(chunk string) {
+	response, turnCount, pendingQ, err := a.claude.SendMessage(ctx, tabID, messageToSend, files, tab.WorkDir, maxTurns, systemPrompt, permissionMode, tools, "", func(chunk string) {
 		chunkCount++
 		streamingContent = chunk
 		fmt.Printf("[App.SendMessage] Chunk %d received (length=%d) - sending via WebSocket\n", chunkCount, len(chunk))
 
 		// Send chunk via WebSocket for real-time delivery
 		a.wsServer.SendStreamChunk(tabID, streamingContent)
+	}, func(toolName, detail string) {
+		toolUses = append(toolUses, models.ToolUse{ToolName: toolName, Detail: detail})
+		a.wsServer.SendToolActivity(tabID, toolName, detail)
+	}, func(input, output int) {
+		lastInputTokens = input
+		lastOutputTokens = output
+		a.wsServer.SendTokenUsage(tabID, input, output)
 	})
 	if err != nil {
 		// Check if cancelled by user
@@ -329,6 +706,37 @@ func (a *App) SendMessage(tabID, message string, files []string) error {
 		a.wsServer.SendStreamError(tabID, err.Error())
 		runtime.EventsEmit(a.ctx, "streaming-end", tabID)
 		return fmt.Errorf("failed to send message to Claude: %w", err)
+	}
+
+	// Handle AskUserQuestion: send question to frontend and wait for user response
+	if pendingQ != nil {
+		fmt.Printf("[App.SendMessage] AskUserQuestion detected (%d questions), sending to frontend\n", len(pendingQ.Questions))
+
+		// Don't save partial text response — the AskUserQuestion panel replaces it
+
+		// Convert to websocket types
+		wsQuestions := make([]websocket.AskUserQuestionItem, len(pendingQ.Questions))
+		for i, q := range pendingQ.Questions {
+			wsOpts := make([]websocket.AskUserQuestionOption, len(q.Options))
+			for j, opt := range q.Options {
+				wsOpts[j] = websocket.AskUserQuestionOption{
+					Label:       opt.Label,
+					Description: opt.Description,
+				}
+			}
+			wsQuestions[i] = websocket.AskUserQuestionItem{
+				Question:    q.Question,
+				Header:      q.Header,
+				Options:     wsOpts,
+				MultiSelect: q.MultiSelect,
+			}
+		}
+
+		// Send question to frontend via WebSocket
+		a.wsServer.SendAskUserQuestion(tabID, pendingQ.ToolUseID, wsQuestions)
+		a.wsServer.SendStreamEnd(tabID)
+		runtime.EventsEmit(a.ctx, "streaming-end", tabID)
+		return nil // Not an error — waiting for user response
 	}
 
 	fmt.Printf("[App.SendMessage] Response received (length=%d), total chunks=%d, turns=%d/%d\n", len(response), chunkCount, turnCount, maxTurns)
@@ -351,25 +759,16 @@ func (a *App) SendMessage(tabID, message string, files []string) error {
 	// Add assistant message to tab
 	durationMs := time.Since(sendStartTime).Milliseconds()
 	responseMsg := models.Message{
-		Role:        "assistant",
-		Content:     response,
-		Attachments: []string{},
-		Timestamp:   0,
-		DurationMs:  durationMs,
+		Role:         "assistant",
+		Content:      response,
+		Attachments:  []string{},
+		Timestamp:    0,
+		DurationMs:   durationMs,
+		InputTokens:  lastInputTokens,
+		OutputTokens: lastOutputTokens,
+		ToolUses:     toolUses,
 	}
 	tab.Messages = append(tab.Messages, responseMsg)
-
-	// If max turns were exhausted, add a system message to inform the user
-	if maxTurns > 0 && turnCount >= maxTurns {
-		fmt.Printf("[App.SendMessage] Max turns exhausted (%d/%d) - adding system notice\n", turnCount, maxTurns)
-		turnsMsg := models.Message{
-			Role:        "system",
-			Content:     fmt.Sprintf("⚠️ 턴 제한(%d턴)에 도달하여 작업이 중단되었습니다. 응답이 완전하지 않을 수 있습니다. 이어서 진행하려면 메시지를 보내주세요.", maxTurns),
-			Attachments: []string{},
-			Timestamp:   0,
-		}
-		tab.Messages = append(tab.Messages, turnsMsg)
-	}
 
 	// Update the tab in the map (important: tab is a pointer, so changes are reflected)
 	a.tabs[tabID] = tab
@@ -385,7 +784,35 @@ func (a *App) SendMessage(tabID, message string, files []string) error {
 	fmt.Println("[App.SendMessage] Emitting tabs-updated event to frontend")
 	runtime.EventsEmit(a.ctx, "tabs-updated")
 
+	// Trigger background agent: tab rename suggestion after first conversation
+	if len(tab.Messages) == 2 && strings.HasPrefix(tab.Name, "대화 ") && a.agentService != nil {
+		a.agentService.Enqueue(claude.AgentTask{
+			Type:             claude.AgentTaskTabRename,
+			TabID:            tabID,
+			WorkDir:          tab.WorkDir,
+			FirstUserMessage: message,
+		})
+	}
+
+	go a.saveState()
+
 	return nil
+}
+
+// AnswerQuestion sends the user's answers to pending AskUserQuestion back to Claude via --resume.
+// The answers map is { questionText: selectedOptionLabel }.
+func (a *App) AnswerQuestion(tabID string, answers map[string]string) error {
+	fmt.Printf("[App.AnswerQuestion] Called with tabID=%s, %d answers\n", tabID, len(answers))
+
+	// Format answers as readable text for Claude to process via --resume
+	var parts []string
+	for question, answer := range answers {
+		parts = append(parts, fmt.Sprintf("Q: %s\nA: %s", question, answer))
+	}
+	answerText := strings.Join(parts, "\n\n")
+
+	// Resume the session with the answer text
+	return a.SendMessage(tabID, answerText, nil)
 }
 
 func min(a, b int) int {
@@ -436,6 +863,8 @@ func (a *App) AddNewTab() (models.TabState, error) {
 		}
 	}
 
+	go a.saveState()
+
 	return *newTab, nil
 }
 
@@ -455,6 +884,8 @@ func (a *App) RemoveTab(tabID string) error {
 	delete(a.tabs, tabID)
 	delete(a.settings.TabSettings, tabID)
 
+	go a.saveState()
+
 	return nil
 }
 
@@ -466,6 +897,7 @@ func (a *App) RenameTab(tabID, newName string) error {
 	}
 
 	tab.Name = newName
+	go a.saveState()
 	return nil
 }
 
@@ -512,6 +944,9 @@ func (a *App) ToggleTabAdminMode(tabID string, enabled bool) error {
 
 // ToggleTabPlanMode toggles plan mode for a specific tab
 func (a *App) ToggleTabPlanMode(tabID string, enabled bool) error {
+	a.tabsMu.Lock()
+	defer a.tabsMu.Unlock()
+
 	tab, exists := a.tabs[tabID]
 	if !exists {
 		return fmt.Errorf("tab not found: %s", tabID)
@@ -519,6 +954,7 @@ func (a *App) ToggleTabPlanMode(tabID string, enabled bool) error {
 
 	tab.PlanMode = enabled
 	fmt.Printf("[App.ToggleTabPlanMode] Tab %s plan mode: %v\n", tabID, enabled)
+	go a.saveState()
 	return nil
 }
 
@@ -668,8 +1104,12 @@ func (a *App) SendAdminMessage(adminTabID, message string, files []string) error
 
 	analysisStartTime := time.Now()
 
-	analysisResponse, _, err := a.claude.SendMessage(ctx, adminTabID, analysisPrompt, files, adminTab.WorkDir, 20, "You are analyzing a codebase. Explore thoroughly using available tools.", "bypassPermissions", "", func(chunk string) {
+	analysisResponse, _, _, err := a.claude.SendMessage(ctx, adminTabID, analysisPrompt, files, adminTab.WorkDir, 20, "You are analyzing a codebase. Explore thoroughly using available tools.", "bypassPermissions", "", "", func(chunk string) {
 		a.wsServer.SendStreamChunk(adminTabID, chunk)
+	}, func(toolName, detail string) {
+		a.wsServer.SendToolActivity(adminTabID, toolName, detail)
+	}, func(input, output int) {
+		a.wsServer.SendTokenUsage(adminTabID, input, output)
 	})
 	if err != nil {
 		if ctx.Err() == context.Canceled {
@@ -733,9 +1173,9 @@ Rules:
 	var decompositionResponse string
 	sendStartTime := time.Now()
 
-	decompositionResponse, _, err = a.claude.SendMessage(ctx, adminTabID, decompositionPrompt, nil, adminTab.WorkDir, 1, "You are a task orchestrator. Respond ONLY with valid JSON.", "bypassPermissions", "", func(chunk string) {
+	decompositionResponse, _, _, err = a.claude.SendMessage(ctx, adminTabID, decompositionPrompt, nil, adminTab.WorkDir, 1, "You are a task orchestrator. Respond ONLY with valid JSON.", "bypassPermissions", "", "", func(chunk string) {
 		a.wsServer.SendStreamChunk(adminTabID, chunk)
-	})
+	}, nil, nil)
 	if err != nil {
 		if ctx.Err() == context.Canceled {
 			a.wsServer.SendStreamEnd(adminTabID)
@@ -971,10 +1411,10 @@ Please synthesize all the results into a comprehensive, well-organized response 
 	synthesisStartTime := time.Now()
 	var synthStreamContent string
 
-	synthesisResponse, _, err := a.claude.SendMessage(ctx, adminTabID, synthesisPrompt, nil, adminTab.WorkDir, 1, "You are a helpful assistant summarizing orchestrated task results.", "bypassPermissions", "", func(chunk string) {
+	synthesisResponse, _, _, err := a.claude.SendMessage(ctx, adminTabID, synthesisPrompt, nil, adminTab.WorkDir, 1, "You are a helpful assistant summarizing orchestrated task results.", "bypassPermissions", "", "", func(chunk string) {
 		synthStreamContent = chunk
 		a.wsServer.SendStreamChunk(adminTabID, chunk)
-	})
+	}, nil, nil)
 	if err != nil {
 		if ctx.Err() == context.Canceled {
 			a.wsServer.SendStreamEnd(adminTabID)
@@ -1000,12 +1440,12 @@ Please synthesize all the results into a comprehensive, well-organized response 
 		Content:    synthesisResponse,
 		DurationMs: totalDuration,
 		Metadata: map[string]string{
-			"type":       "orchestration",
-			"jobId":      jobID,
-			"phase":      "synthesis",
-			"success":    fmt.Sprintf("%d", successCount),
-			"failed":     fmt.Sprintf("%d", failCount),
-			"synthMs":    fmt.Sprintf("%d", synthDuration),
+			"type":    "orchestration",
+			"jobId":   jobID,
+			"phase":   "synthesis",
+			"success": fmt.Sprintf("%d", successCount),
+			"failed":  fmt.Sprintf("%d", failCount),
+			"synthMs": fmt.Sprintf("%d", synthDuration),
 		},
 	}
 	a.tabsMu.Lock()
@@ -1025,6 +1465,8 @@ Please synthesize all the results into a comprehensive, well-organized response 
 
 	runtime.EventsEmit(a.ctx, "tabs-updated")
 	fmt.Printf("[App.SendAdminMessage] Orchestration complete. Total time: %dms\n", totalDuration)
+
+	go a.saveState()
 
 	return nil
 }
@@ -1059,6 +1501,317 @@ func (a *App) CancelOrchestrationJob(adminTabID string) error {
 	return nil
 }
 
+// ToggleTabTeamsMode toggles Teams (Beta) mode for a specific tab.
+// Teams mode and Admin mode are mutually exclusive.
+func (a *App) ToggleTabTeamsMode(tabID string, enabled bool) error {
+	a.tabsMu.Lock()
+	defer a.tabsMu.Unlock()
+
+	tab, exists := a.tabs[tabID]
+	if !exists {
+		return fmt.Errorf("tab not found: %s", tabID)
+	}
+
+	if enabled {
+		// Disable teams mode on all other tabs (only one team tab allowed)
+		for _, t := range a.tabs {
+			if t.ID != tabID {
+				t.TeamsMode = false
+				t.TeamsState = nil
+			}
+		}
+
+		// Disable admin mode if active on this tab (mutually exclusive)
+		tab.AdminMode = false
+		tab.Orchestrator = nil
+
+		// Initialize teams state with all other tabs as workers
+		connectedTabs := []string{}
+		for _, t := range a.tabs {
+			if t.ID != tabID {
+				connectedTabs = append(connectedTabs, t.ID)
+			}
+		}
+		tab.TeamsState = &models.TeamsState{
+			ConnectedTabs: connectedTabs,
+			AgentMapping:  make(map[string]string),
+			IsRunning:     false,
+		}
+		fmt.Printf("[App.ToggleTabTeamsMode] Teams mode enabled for %s, connected workers: %v\n", tabID, connectedTabs)
+	} else {
+		tab.TeamsState = nil
+		fmt.Printf("[App.ToggleTabTeamsMode] Teams mode disabled for %s\n", tabID)
+	}
+
+	tab.TeamsMode = enabled
+	return nil
+}
+
+// ConnectTeamsWorker adds a worker tab to a teams tab
+func (a *App) ConnectTeamsWorker(teamTabID, workerTabID string) error {
+	a.tabsMu.Lock()
+	defer a.tabsMu.Unlock()
+
+	teamTab, exists := a.tabs[teamTabID]
+	if !exists {
+		return fmt.Errorf("team tab not found: %s", teamTabID)
+	}
+	if !teamTab.TeamsMode || teamTab.TeamsState == nil {
+		return fmt.Errorf("tab %s is not in teams mode", teamTabID)
+	}
+	if _, exists := a.tabs[workerTabID]; !exists {
+		return fmt.Errorf("worker tab not found: %s", workerTabID)
+	}
+
+	for _, id := range teamTab.TeamsState.ConnectedTabs {
+		if id == workerTabID {
+			return nil // Already connected
+		}
+	}
+
+	teamTab.TeamsState.ConnectedTabs = append(teamTab.TeamsState.ConnectedTabs, workerTabID)
+	fmt.Printf("[App.ConnectTeamsWorker] Connected %s to team %s\n", workerTabID, teamTabID)
+	return nil
+}
+
+// DisconnectTeamsWorker removes a worker tab from a teams tab
+func (a *App) DisconnectTeamsWorker(teamTabID, workerTabID string) error {
+	a.tabsMu.Lock()
+	defer a.tabsMu.Unlock()
+
+	teamTab, exists := a.tabs[teamTabID]
+	if !exists {
+		return fmt.Errorf("team tab not found: %s", teamTabID)
+	}
+	if !teamTab.TeamsMode || teamTab.TeamsState == nil {
+		return fmt.Errorf("tab %s is not in teams mode", teamTabID)
+	}
+
+	for i, id := range teamTab.TeamsState.ConnectedTabs {
+		if id == workerTabID {
+			teamTab.TeamsState.ConnectedTabs = append(
+				teamTab.TeamsState.ConnectedTabs[:i],
+				teamTab.TeamsState.ConnectedTabs[i+1:]...,
+			)
+			fmt.Printf("[App.DisconnectTeamsWorker] Disconnected %s from team %s\n", workerTabID, teamTabID)
+			return nil
+		}
+	}
+
+	return nil
+}
+
+// SendTeamsMessage handles Teams (Beta) orchestration: single CLI call with --agents flag.
+// Claude autonomously delegates work to sub-agents. Task tool activities are routed to worker tabs.
+func (a *App) SendTeamsMessage(teamTabID, message string, files []string) error {
+	fmt.Printf("[App.SendTeamsMessage] Called with teamTabID=%s, message=%s\n", teamTabID, message)
+
+	a.tabsMu.RLock()
+	teamTab, exists := a.tabs[teamTabID]
+	if !exists {
+		a.tabsMu.RUnlock()
+		return fmt.Errorf("team tab not found: %s", teamTabID)
+	}
+	if !teamTab.TeamsMode || teamTab.TeamsState == nil {
+		a.tabsMu.RUnlock()
+		return fmt.Errorf("tab %s is not in teams mode with teams state", teamTabID)
+	}
+
+	connectedTabs := make([]string, len(teamTab.TeamsState.ConnectedTabs))
+	copy(connectedTabs, teamTab.TeamsState.ConnectedTabs)
+	a.tabsMu.RUnlock()
+
+	if len(connectedTabs) == 0 {
+		return fmt.Errorf("연결된 워커 탭이 없습니다. 다른 탭을 먼저 생성하세요.")
+	}
+
+	// Add user message to team tab
+	userMsg := models.Message{
+		Role:        "user",
+		Content:     message,
+		Attachments: files,
+		Metadata:    map[string]string{"type": "teams"},
+	}
+	a.tabsMu.Lock()
+	teamTab.Messages = append(teamTab.Messages, userMsg)
+	teamTab.TeamsState.IsRunning = true
+	a.tabsMu.Unlock()
+
+	runtime.EventsEmit(a.ctx, "user-message-added", teamTabID)
+
+	// Build agents JSON from connected worker tabs
+	var workerInfos []claude.WorkerTabInfo
+	agentMapping := make(map[string]string) // agentName → workerTabID
+
+	a.tabsMu.RLock()
+	for _, wID := range connectedTabs {
+		if wTab, ok := a.tabs[wID]; ok {
+			info := claude.WorkerTabInfo{
+				ID:      wTab.ID,
+				Name:    wTab.Name,
+				WorkDir: wTab.WorkDir,
+			}
+			workerInfos = append(workerInfos, info)
+			agentName := sanitizeAgentNameForMapping(wTab.Name)
+			agentMapping[agentName] = wTab.ID
+		}
+	}
+	a.tabsMu.RUnlock()
+
+	agentsJSON, err := claude.BuildAgentsJSON(workerInfos)
+	if err != nil {
+		return fmt.Errorf("에이전트 정의 생성 실패: %w", err)
+	}
+
+	// Save agent mapping for activity routing
+	a.tabsMu.Lock()
+	teamTab.TeamsState.AgentMapping = agentMapping
+	a.tabsMu.Unlock()
+
+	fmt.Printf("[App.SendTeamsMessage] Built agents JSON: %s\n", agentsJSON)
+	fmt.Printf("[App.SendTeamsMessage] Agent mapping: %v\n", agentMapping)
+
+	// Create cancellable context
+	ctx, cancel := context.WithCancel(context.Background())
+	a.cancelMu.Lock()
+	a.orchestrationCancel[teamTabID] = cancel
+	a.cancelMu.Unlock()
+	defer func() {
+		cancel()
+		a.cancelMu.Lock()
+		delete(a.orchestrationCancel, teamTabID)
+		a.cancelMu.Unlock()
+		a.tabsMu.Lock()
+		if teamTab.TeamsState != nil {
+			teamTab.TeamsState.IsRunning = false
+		}
+		a.tabsMu.Unlock()
+	}()
+
+	// Build system prompt for teams orchestration
+	var tabInfo []string
+	a.tabsMu.RLock()
+	for _, wID := range connectedTabs {
+		if wTab, ok := a.tabs[wID]; ok {
+			tabInfo = append(tabInfo, fmt.Sprintf("- %s (WorkDir: %s)", wTab.Name, wTab.WorkDir))
+		}
+	}
+	a.tabsMu.RUnlock()
+
+	systemPrompt := fmt.Sprintf(
+		"You are a team orchestrator. You have access to the following worker agents:\n%s\n\n"+
+			"Use the Task tool to delegate work to these agents. "+
+			"Each agent has access to Read, Write, Edit, Bash, Glob, Grep tools. "+
+			"Delegate tasks in parallel when possible. "+
+			"After all tasks are complete, synthesize the results into a comprehensive response.",
+		strings.Join(tabInfo, "\n"))
+
+	// Send streaming start
+	a.wsServer.SendStreamStart(teamTabID)
+	runtime.EventsEmit(a.ctx, "streaming-start", teamTabID)
+
+	sendStartTime := time.Now()
+	var streamingContent string
+
+	// Single CLI call with --agents — Claude autonomously delegates
+	response, _, _, err := a.claude.SendMessage(ctx, teamTabID, message, files, teamTab.WorkDir, 0, systemPrompt, "bypassPermissions", "", agentsJSON,
+		func(chunk string) {
+			streamingContent = chunk
+			a.wsServer.SendStreamChunk(teamTabID, chunk)
+		},
+		func(toolName, detail string) {
+			// Always send tool activity to team tab
+			a.wsServer.SendToolActivity(teamTabID, toolName, detail)
+
+			// If it's a Task tool use, route to the matching worker tab
+			if toolName == "Task" {
+				workerTabID := matchAgentToTab(detail, agentMapping)
+				if workerTabID != "" {
+					a.wsServer.SendOrchestratorEvent(websocket.OrchestratorMessage{
+						Type:        "task-started",
+						AdminTabID:  teamTabID,
+						TaskID:      fmt.Sprintf("teams-%d", time.Now().UnixNano()),
+						WorkerTabID: workerTabID,
+						Content:     detail,
+					})
+				}
+			}
+		},
+		func(input, output int) {
+			a.wsServer.SendTokenUsage(teamTabID, input, output)
+		},
+	)
+
+	if err != nil {
+		if ctx.Err() == context.Canceled {
+			a.wsServer.SendStreamEnd(teamTabID)
+			runtime.EventsEmit(a.ctx, "streaming-end", teamTabID)
+			return nil
+		}
+		a.wsServer.SendStreamError(teamTabID, err.Error())
+		runtime.EventsEmit(a.ctx, "streaming-end", teamTabID)
+		return fmt.Errorf("teams message failed: %w", err)
+	}
+
+	// Send final chunk
+	if streamingContent != "" {
+		a.wsServer.SendStreamChunk(teamTabID, streamingContent)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	a.wsServer.SendStreamEnd(teamTabID)
+	runtime.EventsEmit(a.ctx, "streaming-end", teamTabID)
+
+	// Add response as assistant message
+	durationMs := time.Since(sendStartTime).Milliseconds()
+	responseMsg := models.Message{
+		Role:       "assistant",
+		Content:    response,
+		DurationMs: durationMs,
+		Metadata:   map[string]string{"type": "teams"},
+	}
+	a.tabsMu.Lock()
+	teamTab.Messages = append(teamTab.Messages, responseMsg)
+	a.tabsMu.Unlock()
+
+	// Send job-completed event
+	a.wsServer.SendOrchestratorEvent(websocket.OrchestratorMessage{
+		Type:       "job-completed",
+		AdminTabID: teamTabID,
+		Status:     string(models.TaskCompleted),
+	})
+
+	runtime.EventsEmit(a.ctx, "tabs-updated")
+	fmt.Printf("[App.SendTeamsMessage] Teams orchestration complete. Duration: %dms\n", durationMs)
+
+	go a.saveState()
+
+	return nil
+}
+
+// matchAgentToTab tries to find the worker tab ID for a given Task tool detail string.
+// It checks if any agent name appears in the detail string.
+func matchAgentToTab(detail string, agentMapping map[string]string) string {
+	detailLower := strings.ToLower(detail)
+	for agentName, tabID := range agentMapping {
+		if strings.Contains(detailLower, strings.ToLower(agentName)) {
+			return tabID
+		}
+	}
+	return ""
+}
+
+// sanitizeAgentNameForMapping mirrors the sanitization in claude.sanitizeAgentName
+func sanitizeAgentNameForMapping(name string) string {
+	name = strings.ReplaceAll(name, " ", "-")
+	re := regexp.MustCompile(`[^a-zA-Z0-9가-힣_-]+`)
+	name = re.ReplaceAllString(name, "")
+	if name == "" {
+		name = "worker"
+	}
+	return name
+}
+
 // ClearConversation clears all messages in a conversation tab
 func (a *App) ClearConversation(tabID string) error {
 	tab, exists := a.tabs[tabID]
@@ -1075,6 +1828,7 @@ func (a *App) ClearConversation(tabID string) error {
 	}
 
 	runtime.EventsEmit(a.ctx, "tabs-updated")
+	go a.saveState()
 	return nil
 }
 
@@ -1119,6 +1873,7 @@ func (a *App) SetModel(modelName string) error {
 			a.model = modelName
 			a.claude.SetModel(modelName)
 			fmt.Printf("[App.SetModel] Model changed to: %s\n", modelName)
+			go a.saveState()
 			return nil
 		}
 	}
@@ -1128,6 +1883,179 @@ func (a *App) SetModel(modelName string) error {
 // GetAvailableModels returns the list of allowed model names
 func (a *App) GetAvailableModels() []string {
 	return allowedModels
+}
+
+// GetAvailableSessions returns session metadata from all projects.
+// Current workDir sessions come first, followed by other projects.
+// Agent sessions are excluded from the listing.
+func (a *App) GetAvailableSessions(workDir string) ([]claude.SessionInfo, error) {
+	excludeUUIDs := a.claude.GetAgentSessionUUIDs()
+	return claude.ListAllSessionsExcluding(workDir, excludeUUIDs)
+}
+
+// SwitchTabSession switches a tab to use an existing or new session.
+// If sessionID is empty, creates a new session. Otherwise, loads messages from the JSONL file.
+// projectPath is the project directory the session belongs to (may differ from tab's workDir).
+func (a *App) SwitchTabSession(tabID, sessionID, projectPath string) error {
+	a.tabsMu.Lock()
+	defer a.tabsMu.Unlock()
+
+	tab, exists := a.tabs[tabID]
+	if !exists {
+		return fmt.Errorf("tab not found: %s", tabID)
+	}
+
+	if sessionID == "" {
+		// New session: clear messages and reset CLI session
+		tab.Messages = []models.Message{}
+		a.claude.CreateNewChat(tabID)
+		runtime.EventsEmit(a.ctx, "tabs-updated")
+		go a.saveState()
+		return nil
+	}
+
+	// Check if another tab already uses this session
+	exported := a.claude.ExportSessions()
+	for convID, state := range exported {
+		if convID != tabID && state.SessionID == sessionID {
+			return fmt.Errorf("이 세션은 다른 탭에서 사용 중입니다")
+		}
+	}
+
+	// Build JSONL path using the session's own project path
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("cannot determine home directory: %w", err)
+	}
+	resolvedPath := projectPath
+	if resolvedPath == "" {
+		resolvedPath = tab.WorkDir
+	}
+	encoded := claude.EncodeProjectPath(resolvedPath)
+	jsonlPath := filepath.Join(homeDir, ".claude", "projects", encoded, sessionID+".jsonl")
+
+	// Load messages from JSONL
+	sessionMsgs, err := a.claude.LoadSessionMessages(jsonlPath)
+	if err != nil {
+		return fmt.Errorf("세션 메시지 로드 실패: %w", err)
+	}
+
+	// Convert SessionMessage → models.Message
+	messages := make([]models.Message, 0, len(sessionMsgs))
+	for _, sm := range sessionMsgs {
+		var ts int64
+		if t, err := time.Parse(time.RFC3339Nano, sm.Timestamp); err == nil {
+			ts = t.UnixMilli()
+		}
+		messages = append(messages, models.Message{
+			Role:      sm.Role,
+			Content:   sm.Content,
+			Timestamp: ts,
+		})
+	}
+
+	// 세션의 프로젝트 경로로 작업 디렉토리 동기화
+	if projectPath != "" {
+		tab.WorkDir = projectPath
+	}
+
+	tab.Messages = messages
+	a.claude.SetSession(tabID, sessionID)
+
+	runtime.EventsEmit(a.ctx, "tabs-updated")
+	go a.saveState()
+	return nil
+}
+
+// DeleteSession deletes a session JSONL file. If the session is in use by a tab, clears that tab first.
+func (a *App) DeleteSession(sessionID, projectPath string) error {
+	// If this session is in use by any tab, clear it
+	exported := a.claude.ExportSessions()
+	for convID, state := range exported {
+		if state.SessionID == sessionID {
+			a.claude.CreateNewChat(convID)
+			a.tabsMu.Lock()
+			if tab, ok := a.tabs[convID]; ok {
+				tab.Messages = []models.Message{}
+			}
+			a.tabsMu.Unlock()
+		}
+	}
+
+	if err := a.claude.DeleteSession(projectPath, sessionID); err != nil {
+		return err
+	}
+
+	runtime.EventsEmit(a.ctx, "tabs-updated")
+	go a.saveState()
+	return nil
+}
+
+// GetTabSessionID returns the current session UUID for a tab (empty if not started)
+func (a *App) GetTabSessionID(tabID string) string {
+	exported := a.claude.ExportSessions()
+	if state, ok := exported[tabID]; ok && state.Started {
+		return state.SessionID
+	}
+	return ""
+}
+
+// GetPlanContent returns the plan file content for the current session of a tab.
+// Returns empty string (no error) if no plan file exists.
+func (a *App) GetPlanContent(tabID string) (string, error) {
+	sessionID := a.GetTabSessionID(tabID)
+	if sessionID == "" {
+		fmt.Printf("[GetPlanContent] No session ID for tab %s\n", tabID)
+		return "", nil
+	}
+
+	a.tabsMu.RLock()
+	tab, exists := a.tabs[tabID]
+	a.tabsMu.RUnlock()
+	if !exists {
+		fmt.Printf("[GetPlanContent] Tab not found: %s\n", tabID)
+		return "", nil
+	}
+
+	fmt.Printf("[GetPlanContent] tab=%s, session=%s, workDir=%s\n", tabID, sessionID[:8], tab.WorkDir)
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot determine home directory: %w", err)
+	}
+
+	encoded := claude.EncodeProjectPath(tab.WorkDir)
+	jsonlPath := filepath.Join(homeDir, ".claude", "projects", encoded, sessionID+".jsonl")
+
+	slug, err := claude.ExtractSessionSlug(jsonlPath)
+	if err != nil {
+		fmt.Printf("[GetPlanContent] ExtractSessionSlug error: %v (path: %s)\n", err, jsonlPath)
+		return "", nil
+	}
+	if slug == "" {
+		fmt.Printf("[GetPlanContent] No slug found in %s\n", jsonlPath)
+		return "", nil
+	}
+
+	planPath := filepath.Join(homeDir, ".claude", "plans", slug+".md")
+	fmt.Printf("[GetPlanContent] Looking for plan at: %s\n", planPath)
+	data, err := os.ReadFile(planPath)
+	if err == nil {
+		return string(data), nil
+	}
+
+	// Plan file not found — fall back to last assistant message content
+	fmt.Printf("[GetPlanContent] Plan file not found, falling back to last assistant message\n")
+	a.tabsMu.RLock()
+	messages := tab.Messages
+	a.tabsMu.RUnlock()
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "assistant" && messages[i].Content != "" {
+			return messages[i].Content, nil
+		}
+	}
+
+	return "", nil
 }
 
 // CancelMessage cancels an in-progress message generation
@@ -1165,6 +2093,7 @@ func (a *App) TruncateMessages(tabID string, fromIndex int) error {
 	}
 
 	runtime.EventsEmit(a.ctx, "tabs-updated")
+	go a.saveState()
 	return nil
 }
 
@@ -1181,6 +2110,7 @@ func (a *App) RemoveLastUserMessage(tabID string) error {
 			tab.Messages = append(tab.Messages[:i], tab.Messages[i+1:]...)
 			fmt.Printf("[App.RemoveLastUserMessage] Removed message at index %d from tab %s\n", i, tabID)
 			runtime.EventsEmit(a.ctx, "tabs-updated")
+			go a.saveState()
 			return nil
 		}
 	}
@@ -1219,6 +2149,7 @@ func (a *App) AddContextFile(tabID, filePath string) error {
 
 	tab.ContextFiles = append(tab.ContextFiles, absPath)
 	fmt.Printf("[App.AddContextFile] Tab %s: added context file %s\n", tabID, absPath)
+	go a.saveState()
 	return nil
 }
 
@@ -1233,6 +2164,7 @@ func (a *App) RemoveContextFile(tabID, filePath string) error {
 		if cf == filePath {
 			tab.ContextFiles = append(tab.ContextFiles[:i], tab.ContextFiles[i+1:]...)
 			fmt.Printf("[App.RemoveContextFile] Tab %s: removed context file %s\n", tabID, filePath)
+			go a.saveState()
 			return nil
 		}
 	}
@@ -1247,6 +2179,66 @@ func (a *App) GetContextFileContent(filePath string) (string, error) {
 		return "", fmt.Errorf("파일을 읽을 수 없습니다: %w", err)
 	}
 	return string(content), nil
+}
+
+// SaveFileContent writes content to a file (for editor save)
+func (a *App) SaveFileContent(filePath string, content string) error {
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		return fmt.Errorf("파일이 존재하지 않습니다: %s", filePath)
+	}
+	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+		return fmt.Errorf("파일 저장 실패: %w", err)
+	}
+	return nil
+}
+
+// DeleteFile removes a file from disk
+func (a *App) DeleteFile(filePath string) error {
+	info, err := os.Stat(filePath)
+	if os.IsNotExist(err) {
+		return fmt.Errorf("파일이 존재하지 않습니다: %s", filePath)
+	}
+	if err != nil {
+		return fmt.Errorf("파일 확인 실패: %w", err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("디렉토리는 삭제할 수 없습니다: %s", filePath)
+	}
+	if err := os.Remove(filePath); err != nil {
+		return fmt.Errorf("파일 삭제 실패: %w", err)
+	}
+	return nil
+}
+
+// RenameFile renames (moves) a file from oldPath to newPath
+func (a *App) RenameFile(oldPath string, newPath string) error {
+	if _, err := os.Stat(oldPath); os.IsNotExist(err) {
+		return fmt.Errorf("파일이 존재하지 않습니다: %s", oldPath)
+	}
+	if _, err := os.Stat(newPath); err == nil {
+		return fmt.Errorf("대상 파일이 이미 존재합니다: %s", newPath)
+	}
+	dir := filepath.Dir(newPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("디렉토리 생성 실패: %w", err)
+	}
+	if err := os.Rename(oldPath, newPath); err != nil {
+		return fmt.Errorf("파일 이름 변경 실패: %w", err)
+	}
+	return nil
+}
+
+// CreateClaudeMd creates a CLAUDE.md file in the given workDir with a default template
+func (a *App) CreateClaudeMd(workDir string) (string, error) {
+	filePath := filepath.Join(workDir, "CLAUDE.md")
+	if _, err := os.Stat(filePath); err == nil {
+		return filePath, fmt.Errorf("CLAUDE.md가 이미 존재합니다: %s", filePath)
+	}
+	content := "# CLAUDE.md\n\n프로젝트 컨텍스트를 여기에 작성하세요.\n"
+	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+		return "", fmt.Errorf("CLAUDE.md 생성 실패: %w", err)
+	}
+	return filePath, nil
 }
 
 // AutoContextFile represents a file automatically referenced by Claude CLI
@@ -1275,8 +2267,8 @@ func (a *App) GetAutoContextFiles(workDir string) []AutoContextFile {
 
 	// Also scan .claude/commands/ directories
 	for _, dir := range []struct {
-		base  string
-		scope string
+		base   string
+		scope  string
 		prefix string
 	}{
 		{filepath.Join(workDir, ".claude", "commands"), "project", ".claude/commands/"},
@@ -1357,6 +2349,32 @@ func (a *App) SetWorkDir(tabID, dir string) error {
 	if a.claude.IsInitialized() {
 		a.claude.CreateNewChat(tabID)
 	}
+
+	// Clear messages from previous directory and notify frontend
+	tab.Messages = []models.Message{}
+	a.tabs[tabID] = tab
+
+	runtime.EventsEmit(a.ctx, "tabs-updated")
+
+	// Trigger background agent tasks for the new work directory
+	if a.agentService != nil {
+		a.agentService.Enqueue(claude.AgentTask{
+			Type:    claude.AgentTaskProjectSummary,
+			TabID:   tabID,
+			WorkDir: absDir,
+		})
+		// Suggest CLAUDE.md if it doesn't exist in the project
+		claudeMdPath := filepath.Join(absDir, "CLAUDE.md")
+		if _, err := os.Stat(claudeMdPath); os.IsNotExist(err) {
+			a.agentService.Enqueue(claude.AgentTask{
+				Type:    claude.AgentTaskClaudeMd,
+				TabID:   tabID,
+				WorkDir: absDir,
+			})
+		}
+	}
+
+	go a.saveState()
 
 	return nil
 }
@@ -1741,14 +2759,167 @@ document.addEventListener('keydown', function(e) {
 	return nil
 }
 
+// saveState persists the current application state to disk.
+// Safe to call from goroutines; errors are logged but not propagated.
+func (a *App) saveState() {
+	if a.store == nil {
+		return
+	}
+
+	a.tabsMu.RLock()
+	tabs := make([]*models.TabState, 0, len(a.tabs))
+	for _, tab := range a.tabs {
+		cp := *tab
+		cp.Orchestrator = nil // ephemeral, don't persist
+		cp.TeamsState = nil   // ephemeral, don't persist
+		if cp.Messages == nil {
+			cp.Messages = []models.Message{}
+		}
+		if cp.ContextFiles == nil {
+			cp.ContextFiles = []string{}
+		}
+		tabs = append(tabs, &cp)
+	}
+	settings := *a.settings
+	a.tabsMu.RUnlock()
+
+	// Export CLI session mappings
+	exported := a.claude.ExportSessions()
+	sessionMappings := make(map[string]persistence.SessionMapping, len(exported))
+	for k, v := range exported {
+		sessionMappings[k] = persistence.SessionMapping{
+			SessionID: v.SessionID,
+			Started:   v.Started,
+		}
+	}
+
+	state := &persistence.AppState{
+		Model:           a.model,
+		Settings:        &settings,
+		Tabs:            tabs,
+		SessionMappings: sessionMappings,
+	}
+
+	if err := a.store.Save(state); err != nil {
+		fmt.Printf("[App.saveState] Error saving state: %v\n", err)
+	}
+}
+
 // shutdown is called when the app is closing
 func (a *App) shutdown(ctx context.Context) {
+	// Stop background agent service
+	if a.agentService != nil {
+		a.agentService.Stop()
+	}
+
+	// Synchronous save before exit
+	a.saveState()
+
 	// Close Claude service
 	if a.claude != nil {
 		if err := a.claude.Close(); err != nil {
 			fmt.Printf("Error closing Claude service: %v\n", err)
 		}
 	}
+}
+
+// handleAgentResult dispatches background agent results to the frontend via Wails events
+func (a *App) handleAgentResult(result claude.AgentResult) {
+	switch result.Type {
+	case claude.AgentTaskTabRename:
+		runtime.EventsEmit(a.ctx, "agent-tab-rename", map[string]interface{}{
+			"tabID": result.TabID,
+			"name":  result.Data["name"],
+		})
+	case claude.AgentTaskProjectSummary:
+		runtime.EventsEmit(a.ctx, "agent-project-summary", map[string]interface{}{
+			"workDir":   result.WorkDir,
+			"summary":   result.Data["summary"],
+			"language":  result.Data["language"],
+			"framework": result.Data["framework"],
+		})
+	case claude.AgentTaskClaudeMd:
+		runtime.EventsEmit(a.ctx, "agent-claudemd-suggestion", map[string]interface{}{
+			"workDir": result.WorkDir,
+			"content": result.Data["content"],
+		})
+	case claude.AgentTaskContextFiles:
+		runtime.EventsEmit(a.ctx, "agent-context-recommendation", map[string]interface{}{
+			"tabID": result.TabID,
+			"files": result.Data["files"],
+		})
+	case claude.AgentTaskCodeReview:
+		runtime.EventsEmit(a.ctx, "agent-code-review", map[string]interface{}{
+			"tabID":   result.TabID,
+			"issues":  result.Data["issues"],
+			"summary": result.Data["summary"],
+		})
+	}
+}
+
+// GetAgentModel returns the current agent model name
+func (a *App) GetAgentModel() string {
+	return a.settings.AgentModel
+}
+
+// SetAgentModel updates the model used for background agent tasks
+func (a *App) SetAgentModel(model string) error {
+	a.settings.AgentModel = model
+	if a.agentService != nil {
+		a.agentService.SetModel(model)
+	}
+	go a.saveState()
+	return nil
+}
+
+// RequestContextRecommendation triggers a context file recommendation for the given tab
+func (a *App) RequestContextRecommendation(tabID string) {
+	tab, exists := a.tabs[tabID]
+	if !exists || a.agentService == nil {
+		return
+	}
+	a.agentService.Enqueue(claude.AgentTask{
+		Type:    claude.AgentTaskContextFiles,
+		TabID:   tabID,
+		WorkDir: tab.WorkDir,
+	})
+}
+
+// RequestCodeReview triggers a code review agent for the given tab's git diff
+func (a *App) RequestCodeReview(tabID string) error {
+	tab, exists := a.tabs[tabID]
+	if !exists || a.agentService == nil {
+		return fmt.Errorf("tab not found or agent service unavailable")
+	}
+
+	// Run git diff in the tab's workDir
+	cmd := exec.CommandContext(context.Background(), "git", "diff")
+	cmd.Dir = tab.WorkDir
+	out, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("git diff failed: %w", err)
+	}
+	diff := string(out)
+
+	// Also check staged changes if unstaged diff is empty
+	if diff == "" {
+		cmd2 := exec.CommandContext(context.Background(), "git", "diff", "--staged")
+		cmd2.Dir = tab.WorkDir
+		out2, _ := cmd2.Output()
+		diff = string(out2)
+	}
+
+	if diff == "" {
+		return fmt.Errorf("no changes to review")
+	}
+
+	a.agentService.Enqueue(claude.AgentTask{
+		Type:    claude.AgentTaskCodeReview,
+		TabID:   tabID,
+		WorkDir: tab.WorkDir,
+		GitDiff: diff,
+	})
+	return nil
 }
 
 // SelectFiles opens a file dialog and returns selected file paths

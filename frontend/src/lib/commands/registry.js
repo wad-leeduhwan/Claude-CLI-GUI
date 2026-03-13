@@ -103,6 +103,18 @@ const commands = [
     }
   },
   {
+    name: 'plan',
+    description: '현재 세션의 플랜 파일 보기',
+    icon: '📋',
+    needsBackend: true,
+    handler: async (tabId) => {
+      const { GetPlanContent } = await import('../../../wailsjs/go/main/App');
+      const content = await GetPlanContent(tabId);
+      if (!content) return { type: 'message', content: '플랜 파일을 찾을 수 없습니다.' };
+      return { type: 'plan-view', content };
+    }
+  },
+  {
     name: 'apply',
     description: '플랜 모드의 분석 결과를 실행',
     icon: '▶️',

@@ -86,3 +86,43 @@ func (s *Service) UseAPI() bool {
 func (s *Service) IsSessionStarted(conversationID string) bool {
 	return s.cliWrapper.IsSessionStarted(conversationID)
 }
+
+// ExportSessions returns a snapshot of all CLI session mappings (for persistence)
+func (s *Service) ExportSessions() map[string]SessionState {
+	return s.cliWrapper.ExportSessions()
+}
+
+// ImportSessions restores CLI session mappings from a persisted snapshot
+func (s *Service) ImportSessions(mappings map[string]SessionState) {
+	s.cliWrapper.ImportSessions(mappings)
+}
+
+// ListSessions returns available sessions for the given working directory
+func (s *Service) ListSessions(workDir string) ([]SessionInfo, error) {
+	return ListSessions(workDir)
+}
+
+// ListAllSessions returns sessions from all projects, current workDir first
+func (s *Service) ListAllSessions(currentWorkDir string) ([]SessionInfo, error) {
+	return ListAllSessions(currentWorkDir)
+}
+
+// LoadSessionMessages loads messages from a session JSONL file
+func (s *Service) LoadSessionMessages(filePath string) ([]SessionMessage, error) {
+	return LoadSessionMessages(filePath)
+}
+
+// SetSession assigns an existing session ID to a conversation (for --resume)
+func (s *Service) SetSession(conversationID, sessionID string) {
+	s.cliWrapper.SetSession(conversationID, sessionID)
+}
+
+// DeleteSession removes a session JSONL file from disk
+func (s *Service) DeleteSession(projectPath, sessionID string) error {
+	return DeleteSession(projectPath, sessionID)
+}
+
+// GetAgentSessionUUIDs returns session UUIDs used by background agents
+func (s *Service) GetAgentSessionUUIDs() map[string]bool {
+	return s.cliWrapper.GetAgentSessionUUIDs()
+}

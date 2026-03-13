@@ -43,14 +43,38 @@ function createStreamingStore() {
             case 'start':
               update(state => ({
                 ...state,
-                [msg.tabId]: { isStreaming: true, content: '' }
+                [msg.tabId]: { isStreaming: true, content: '', toolActivity: null, tokenUsage: null }
               }));
               break;
 
             case 'chunk':
               update(state => ({
                 ...state,
-                [msg.tabId]: { isStreaming: true, content: msg.content }
+                [msg.tabId]: {
+                  ...state[msg.tabId],
+                  isStreaming: true,
+                  content: msg.content
+                }
+              }));
+              break;
+
+            case 'tool-activity':
+              update(state => ({
+                ...state,
+                [msg.tabId]: {
+                  ...state[msg.tabId],
+                  toolActivity: { toolName: msg.toolName, detail: msg.detail }
+                }
+              }));
+              break;
+
+            case 'token-usage':
+              update(state => ({
+                ...state,
+                [msg.tabId]: {
+                  ...state[msg.tabId],
+                  tokenUsage: { inputTokens: msg.inputTokens, outputTokens: msg.outputTokens }
+                }
               }));
               break;
 
@@ -59,7 +83,25 @@ function createStreamingStore() {
                 ...state,
                 [msg.tabId]: {
                   isStreaming: false,
-                  content: state[msg.tabId]?.content || ''
+                  content: state[msg.tabId]?.content || '',
+                  toolActivity: null,
+                  tokenUsage: state[msg.tabId]?.tokenUsage || null,
+                  pendingQuestion: state[msg.tabId]?.pendingQuestion
+                }
+              }));
+              break;
+
+            case 'ask-user-question':
+              console.log('[StreamingStore] AskUserQuestion received:', msg.toolUseId, msg.questions?.length);
+              update(state => ({
+                ...state,
+                [msg.tabId]: {
+                  ...state[msg.tabId],
+                  isStreaming: false,
+                  pendingQuestion: {
+                    toolUseId: msg.toolUseId,
+                    questions: msg.questions
+                  }
                 }
               }));
               break;

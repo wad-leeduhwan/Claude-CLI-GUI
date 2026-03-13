@@ -150,6 +150,92 @@ func (s *Server) SendStreamError(tabID, error string) {
 	})
 }
 
+// ToolActivityMessage represents a tool activity event sent during streaming
+type ToolActivityMessage struct {
+	Type     string `json:"type"` // "tool-activity"
+	TabID    string `json:"tabId"`
+	ToolName string `json:"toolName"`
+	Detail   string `json:"detail"`
+}
+
+// SendToolActivity broadcasts a tool activity event to all connected clients
+func (s *Server) SendToolActivity(tabID, toolName, detail string) {
+	msg := ToolActivityMessage{
+		Type:     "tool-activity",
+		TabID:    tabID,
+		ToolName: toolName,
+		Detail:   detail,
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		fmt.Printf("[WebSocket] ToolActivity marshal error: %v\n", err)
+		return
+	}
+	s.broadcast(data)
+}
+
+// TokenUsageMessage represents a token usage update sent during streaming
+type TokenUsageMessage struct {
+	Type         string `json:"type"` // "token-usage"
+	TabID        string `json:"tabId"`
+	InputTokens  int    `json:"inputTokens"`
+	OutputTokens int    `json:"outputTokens"`
+}
+
+// SendTokenUsage broadcasts a token usage update to all connected clients
+func (s *Server) SendTokenUsage(tabID string, input, output int) {
+	msg := TokenUsageMessage{
+		Type:         "token-usage",
+		TabID:        tabID,
+		InputTokens:  input,
+		OutputTokens: output,
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		fmt.Printf("[WebSocket] TokenUsage marshal error: %v\n", err)
+		return
+	}
+	s.broadcast(data)
+}
+
+// AskUserQuestionMessage represents an AskUserQuestion event sent to the frontend
+type AskUserQuestionMessage struct {
+	Type      string               `json:"type"`      // "ask-user-question"
+	TabID     string               `json:"tabId"`
+	ToolUseID string               `json:"toolUseId"`
+	Questions []AskUserQuestionItem `json:"questions"`
+}
+
+// AskUserQuestionItem represents a single question (mirrors claude.AskQuestion for JSON serialization)
+type AskUserQuestionItem struct {
+	Question    string                    `json:"question"`
+	Header      string                    `json:"header"`
+	Options     []AskUserQuestionOption   `json:"options"`
+	MultiSelect bool                      `json:"multiSelect"`
+}
+
+// AskUserQuestionOption represents a selectable option
+type AskUserQuestionOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description"`
+}
+
+// SendAskUserQuestion broadcasts an AskUserQuestion event to all connected clients
+func (s *Server) SendAskUserQuestion(tabID, toolUseID string, questions []AskUserQuestionItem) {
+	msg := AskUserQuestionMessage{
+		Type:      "ask-user-question",
+		TabID:     tabID,
+		ToolUseID: toolUseID,
+		Questions: questions,
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		fmt.Printf("[WebSocket] AskUserQuestion marshal error: %v\n", err)
+		return
+	}
+	s.broadcast(data)
+}
+
 // OrchestratorMessage represents an orchestration event message
 type OrchestratorMessage struct {
 	Type        string `json:"type"`                  // task-started, task-completed, task-failed, job-completed
