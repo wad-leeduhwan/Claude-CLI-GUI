@@ -187,16 +187,6 @@
     agentStore.setProjectSummary(data.workDir, data);
   }
 
-  function handleAgentClaudeMdSuggestion(data) {
-    console.log('[Agent] claudemd-suggestion:', data);
-    agentStore.setClaudeMdSuggestion(data.workDir, data.content);
-  }
-
-  function handleAgentContextRecommendation(data) {
-    console.log('[Agent] context-recommendation:', data);
-    agentStore.setContextRecommendation(data.tabID, data.files);
-  }
-
   function handleAgentCodeReview(data) {
     console.log('[Agent] code-review:', data);
     agentStore.setCodeReview(data.tabID, data);
@@ -224,8 +214,6 @@
     EventsOff('streaming-end');
     EventsOff('agent-tab-rename');
     EventsOff('agent-project-summary');
-    EventsOff('agent-claudemd-suggestion');
-    EventsOff('agent-context-recommendation');
     EventsOff('agent-code-review');
 
     // Register Wails event listeners (backup for non-streaming events)
@@ -239,8 +227,6 @@
     // Agent background task events
     EventsOn('agent-tab-rename', handleAgentTabRename);
     EventsOn('agent-project-summary', handleAgentProjectSummary);
-    EventsOn('agent-claudemd-suggestion', handleAgentClaudeMdSuggestion);
-    EventsOn('agent-context-recommendation', handleAgentContextRecommendation);
     EventsOn('agent-code-review', handleAgentCodeReview);
 
     console.log('[DynamicSplitLayout] Event listeners registered');
@@ -285,8 +271,6 @@
     EventsOff('streaming-end');
     EventsOff('agent-tab-rename');
     EventsOff('agent-project-summary');
-    EventsOff('agent-claudemd-suggestion');
-    EventsOff('agent-context-recommendation');
     EventsOff('agent-code-review');
   });
 

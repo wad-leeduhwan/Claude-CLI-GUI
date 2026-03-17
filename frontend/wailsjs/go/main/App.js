@@ -14,6 +14,10 @@ export function AnswerQuestion(arg1, arg2) {
   return window['go']['main']['App']['AnswerQuestion'](arg1, arg2);
 }
 
+export function ApplyTeamPreset(arg1, arg2) {
+  return window['go']['main']['App']['ApplyTeamPreset'](arg1, arg2);
+}
+
 export function CancelMessage(arg1) {
   return window['go']['main']['App']['CancelMessage'](arg1);
 }
@@ -46,12 +50,20 @@ export function CreateClaudeMd(arg1) {
   return window['go']['main']['App']['CreateClaudeMd'](arg1);
 }
 
+export function CreateTabClaudeMd(arg1) {
+  return window['go']['main']['App']['CreateTabClaudeMd'](arg1);
+}
+
 export function DeleteFile(arg1) {
   return window['go']['main']['App']['DeleteFile'](arg1);
 }
 
 export function DeleteSession(arg1, arg2) {
   return window['go']['main']['App']['DeleteSession'](arg1, arg2);
+}
+
+export function DeleteTeamPreset(arg1) {
+  return window['go']['main']['App']['DeleteTeamPreset'](arg1);
 }
 
 export function DetectInstallMethod() {
@@ -122,6 +134,10 @@ export function GetTabs() {
   return window['go']['main']['App']['GetTabs']();
 }
 
+export function GetTeamPresets() {
+  return window['go']['main']['App']['GetTeamPresets']();
+}
+
 export function GetUsageInfo(arg1) {
   return window['go']['main']['App']['GetUsageInfo'](arg1);
 }
@@ -166,12 +182,16 @@ export function RenameTab(arg1, arg2) {
   return window['go']['main']['App']['RenameTab'](arg1, arg2);
 }
 
+export function RenameTeamPreset(arg1, arg2) {
+  return window['go']['main']['App']['RenameTeamPreset'](arg1, arg2);
+}
+
 export function RequestCodeReview(arg1) {
   return window['go']['main']['App']['RequestCodeReview'](arg1);
 }
 
-export function RequestContextRecommendation(arg1) {
-  return window['go']['main']['App']['RequestContextRecommendation'](arg1);
+export function ResumeSessionInTerminal(arg1, arg2) {
+  return window['go']['main']['App']['ResumeSessionInTerminal'](arg1, arg2);
 }
 
 export function SaveDroppedFile(arg1, arg2) {
@@ -184,6 +204,10 @@ export function SaveDroppedImage(arg1, arg2) {
 
 export function SaveFileContent(arg1, arg2) {
   return window['go']['main']['App']['SaveFileContent'](arg1, arg2);
+}
+
+export function SaveTeamPreset(arg1, arg2) {
+  return window['go']['main']['App']['SaveTeamPreset'](arg1, arg2);
 }
 
 export function SearchFiles(arg1, arg2) {

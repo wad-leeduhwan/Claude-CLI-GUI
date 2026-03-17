@@ -1,6 +1,6 @@
 <script>
   import { createEventDispatcher, onDestroy, onMount, afterUpdate, tick } from 'svelte';
-  import { SendMessage, SendAdminMessage, SendTeamsMessage, CancelMessage, CancelOrchestrationJob, RemoveLastUserMessage, TruncateMessages, ToggleTabAdminMode, ToggleTabPlanMode, ToggleTabTeamsMode, SelectFiles, GetFileInfo, GetCurrentModel, SetModel, GetAvailableModels, SaveDroppedImage, SaveDroppedFile, ReadFileSnippet, CompletePath, SearchFiles, OpenExpandedView, IsGitRepo, AnswerQuestion, RequestCodeReview, GetPlanContent } from '../../../wailsjs/go/main/App';
+  import { SendMessage, SendAdminMessage, SendTeamsMessage, CancelMessage, CancelOrchestrationJob, RemoveLastUserMessage, TruncateMessages, ToggleTabAdminMode, ToggleTabPlanMode, ToggleTabTeamsMode, SelectFiles, GetFileInfo, GetCurrentModel, SetModel, GetAvailableModels, SaveDroppedImage, SaveDroppedFile, ReadFileSnippet, CompletePath, SearchFiles, OpenExpandedView, IsGitRepo, AnswerQuestion, RequestCodeReview, GetPlanContent, ClearConversation } from '../../../wailsjs/go/main/App';
   import MarkdownViewer from './MarkdownViewer.svelte';
   import SlashCommandPopup from './SlashCommandPopup.svelte';
   import FilePathPopup from './FilePathPopup.svelte';
@@ -18,6 +18,8 @@
   export let teamsMode = false;
   export let planMode = false;
   export let workDir = '';
+  export let isTeamsWorkerBusy = false;
+  export let workerTabNames = {};
 
   let inputMessage = '';
   let inputHistory = [];      // 보낸 메시지 히스토리 배열
@@ -86,7 +88,6 @@
   let cliPanel = null; // null | { type: 'model-select', models, currentModel } | { type: 'result', content }
   let cliPanelSelectedIndex = 0;
   let cliPanelTimer = null;
-  let choiceDismissed = false; // user explicitly closed the choice panel
   let cliPanelEl; // focusable cli-panel element reference
 
   // Image lightbox state
@@ -171,7 +172,29 @@
   $: streamingContent = $streamingStore[tabId]?.content || '';
   $: toolActivity = $streamingStore[tabId]?.toolActivity || null;
   $: tokenUsage = $streamingStore[tabId]?.tokenUsage || null;
+  $: contextPercent = tokenUsage
+    ? Math.round(tokenUsage.inputTokens / 200000 * 100)
+    : 0;
   $: console.log(`[ConversationTab ${tabId}] Store updated - content length: ${streamingContent.length}`);
+
+  // Teams 워커 탭: isTeamsWorkerBusy만으로 스트리밍 UI 자동 토글
+  let workerStreamingActive = false;
+  $: {
+    if (isTeamsWorkerBusy && !workerStreamingActive) {
+      workerStreamingActive = true;
+      sending = true;
+      startStreamingTimer();
+      autoScrollEnabled = true;
+    } else if (!isTeamsWorkerBusy && workerStreamingActive) {
+      workerStreamingActive = false;
+      sending = false;
+      stopStreamingTimer();
+      stopTypingEffect();
+      setTimeout(() => {
+        if (componentActive) streamingStore.clear(tabId);
+      }, 500);
+    }
+  }
 
   // When streaming content changes, start typing effect
   $: if (streamingContent && streamingContent !== fullContent) {
@@ -182,12 +205,11 @@
   $: {
     const lastMsg = displayMessages.length > 0
       ? displayMessages[displayMessages.length - 1] : null;
-    const lastContent = lastMsg?.role === 'assistant' ? (lastMsg.content || '') : '';
-    const isAsking = lastContent && isAssistantAsking(lastContent);
-    const planReady = planMode && !sending && planResponseReceived && lastMsg && lastMsg.role === 'assistant' && !isAsking;
+    const hasPendingQuestion = !!$streamingStore[tabId]?.pendingQuestion;
+    const planReady = planMode && !sending && planResponseReceived && lastMsg && lastMsg.role === 'assistant' && !hasPendingQuestion;
 
-    if (planReady && (!cliPanel || cliPanel.type === 'plan-ready')) {
-      cliPanel = { type: 'plan-ready' };
+    if (planReady && !cliPanel) {
+      cliPanel = { type: 'plan-ready', selectedIndex: 0, showCustomInput: false, customText: '' };
     } else if (!planReady && cliPanel && cliPanel.type === 'plan-ready') {
       cliPanel = null;
     }
@@ -206,7 +228,9 @@
         selectedIndex: 0,
         reviewing: false,
         customText: '',
-        showCustomInput: false
+        showCustomInput: false,
+        editingIndex: -1,
+        multiSelections: {}
       };
     }
   }
@@ -353,150 +377,25 @@
   let copiedIndex = null;
   let copiedTimer = null;
 
-  // Quick reply choices parsed from last assistant message
-  let quickReplies = { question: '', choices: [] };
-
-  function parseQuickReplies(msgs) {
-    if (!msgs || msgs.length === 0 || sending) return { question: '', choices: [] };
-    // Find the last assistant message
-    for (let i = msgs.length - 1; i >= 0; i--) {
-      if (msgs[i].role === 'assistant') {
-        return extractChoices(msgs[i].content);
-      }
-    }
-    return { question: '', choices: [] };
-  }
-
-  function extractChoices(text) {
-    if (!text) return { question: '', choices: [] };
-    const lines = text.split('\n');
-    const choices = [];
-    let choiceStartIndex = -1;
-
-    // Pass 1: Scan from end for numbered options (highest priority)
-    let foundEnd = false;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (!line) {
-        if (foundEnd) continue;
-        continue;
-      }
-      const numMatch = line.match(/^(?:[-*]\s*)?(\d+)[.):\]]\s*(.+)$/);
-      if (numMatch) {
-        choices.unshift({ num: numMatch[1], text: numMatch[2].trim() });
-        choiceStartIndex = i;
-        foundEnd = true;
-      } else {
-        if (foundEnd) break;
-        if (lines.length - i > 20) break;
-      }
-    }
-
-    // Pass 2: If no numbered choices, try bullet patterns as fallback
-    if (choices.length < 2) {
-      choices.length = 0;
-      choiceStartIndex = -1;
-      foundEnd = false;
-      for (let i = lines.length - 1; i >= 0; i--) {
-        const line = lines[i].trim();
-        if (!line) {
-          if (foundEnd) continue;
-          continue;
-        }
-        const numMatch = line.match(/^(?:[-*]\s*)?(\d+)[.):\]]\s*(.+)$/);
-        if (numMatch) {
-          choices.unshift({ num: numMatch[1], text: numMatch[2].trim() });
-          choiceStartIndex = i;
-          foundEnd = true;
-        } else {
-          const bulletMatch = line.match(/^[-*]\s+(.+)$/);
-          if (bulletMatch) {
-            choices.unshift({ num: null, text: bulletMatch[1].trim() });
-            choiceStartIndex = i;
-            foundEnd = true;
-          } else {
-            break; // 불릿은 반드시 메시지 끝에 위치해야 함
-          }
-        }
-      }
-      // Auto-assign numbers to bullet-only choices
-      if (choices.some(c => c.num === null)) {
-        choices.forEach((c, i) => { if (c.num === null) c.num = String(i + 1); });
-      }
-    }
-
-    // Need 2+ choices
-    if (choices.length < 2) return { question: '', choices: [] };
-
-    // Look for a question line above the choices
-    // Search upwards from choiceStartIndex for a line ending with ? or Korean question markers
-    let question = '';
-    for (let i = choiceStartIndex - 1; i >= 0 && i >= choiceStartIndex - 5; i--) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      // Strip markdown inline formatting for pattern matching
-      const stripped = line.replace(/[*_`~]+/g, '').trim();
-      // Check if line looks like a question (ends with ?, 까요?, 세요?, 나요?, etc.)
-      if (/[?？]$/.test(stripped) || /(?:까요|세요|나요|할까|는지|을까|ㄹ까)\s*[.?]?\s*$/.test(stripped)) {
-        question = stripped;
-        break;
-      }
-      // Also accept lines that look like a prompt (e.g., "선택해주세요", "골라주세요")
-      if (/(?:선택|골라|알려|결정|지정)/.test(stripped) && stripped.length < 100) {
-        question = stripped;
-        break;
-      }
-    }
-
-    // If no question found, these are likely explanatory steps, not choices
-    if (!question) return { question: '', choices: [] };
-
-    return { question, choices };
-  }
-
   function isAssistantAsking(text) {
     if (!text) return false;
     const lines = text.trim().split('\n');
-    // Check if message ends with numbered choices (2+ consecutive)
-    let choiceCount = 0;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      if (/^(?:[-*]\s*)?(\d+)[.):\]]\s*.+$/.test(line)) {
-        choiceCount++;
-      } else {
-        break;
-      }
+    const lastLines = lines.slice(-3);
+    for (const line of lastLines) {
+      const t = line.trim();
+      if (t.endsWith('?') || t.endsWith('？')) return true;
+      if (/(?:까요|세요|나요|할까|는지|을까|ㄹ까)\s*[.!]?\s*$/.test(t)) return true;
     }
-    if (choiceCount >= 2) return true;
-
-    // Check if ends with question pattern
-    const lastNonEmpty = [...lines].reverse().find(l => l.trim());
-    if (!lastNonEmpty) return false;
-    const trimmed = lastNonEmpty.trim();
-    if (/[?？]\s*$/.test(trimmed)) return true;
-    if (/(?:까요|세요|나요|할까|는지|을까|ㄹ까|주세요)\s*[.?]?\s*$/.test(trimmed)) return true;
     return false;
   }
 
-  // Reactively parse quick replies from displayed messages and show as CLI panel
-  $: {
-    const parsed = !sending ? parseQuickReplies(displayMessages) : { question: '', choices: [] };
-    quickReplies = parsed;
-    if (parsed.choices.length > 0 && !choiceDismissed) {
-      if (!cliPanel || cliPanel.type === 'plan-ready' || (cliPanel.type === 'choice' && cliPanel.question !== parsed.question)) {
-        cliPanel = { type: 'choice', question: parsed.question, choices: parsed.choices, showCustomInput: false, customText: '' };
-        cliPanelSelectedIndex = 0;
-      }
-    } else if (parsed.choices.length === 0) {
-      if (cliPanel?.type === 'choice') cliPanel = null;
-      choiceDismissed = false; // reset when choices disappear (new messages arrive)
-    }
-  }
-
   // Auto-focus cliPanel when navigable choices appear
-  $: if (cliPanel && (cliPanel.type === 'choice' || cliPanel.type === 'model-select' || cliPanel.type === 'ask-user-question')) {
-    tick().then(() => cliPanelEl?.focus());
+  $: if (cliPanel && (cliPanel.type === 'model-select' || cliPanel.type === 'ask-user-question')) {
+    tick().then(() => {
+      const ae = document.activeElement;
+      if (ae && (ae.tagName === 'TEXTAREA' || ae.tagName === 'INPUT')) return;
+      cliPanelEl?.focus();
+    });
   }
 
   // Re-run search when messages change
@@ -623,7 +522,6 @@
   }
 
   function closeCliPanel() {
-    if (cliPanel?.type === 'choice') choiceDismissed = true;
     if (cliPanel?.type === 'ask-user-question') {
       // Clear pendingQuestion from streaming store to prevent reactive re-trigger
       streamingStore.clear(tabId);
@@ -656,49 +554,36 @@
     }
   }
 
-  function selectChoice() {
-    if (!cliPanel || cliPanel.type !== 'choice') return;
-    // "Other" option selected
-    if (cliPanelSelectedIndex === cliPanel.choices.length) {
-      cliPanel.showCustomInput = true;
-      cliPanel.customText = '';
-      cliPanel = cliPanel;
-      tick().then(() => {
-        const el = document.querySelector('.cli-custom-input');
-        if (el) el.focus();
-      });
-      return;
-    }
-    const choice = cliPanel.choices[cliPanelSelectedIndex];
-    if (!choice) return;
-    cliPanel = null;
-    quickReplies = { question: '', choices: [] };
-    inputMessage = choice.num + ') ' + choice.text;
-    tick().then(() => {
-      textareaEl?.focus();
-      handleSend();
-    });
-  }
-
-  function submitChoiceCustom() {
-    if (!cliPanel || cliPanel.type !== 'choice') return;
-    const text = (cliPanel.customText || '').trim();
-    if (!text) return;
-    cliPanel = null;
-    quickReplies = { question: '', choices: [] };
-    inputMessage = text;
-    tick().then(() => {
-      textareaEl?.focus();
-      handleSend();
-    });
-  }
-
   // --- AskUserQuestion handlers ---
 
   function pickAskOption(idx) {
     if (!cliPanel || cliPanel.type !== 'ask-user-question') return;
     const q = cliPanel.questions[cliPanel.currentStep];
-    cliPanel.answers[q.question] = q.options[idx].label;
+    const label = q.options[idx].label;
+
+    // "직접 입력하겠다"는 의미의 옵션이면 커스텀 입력으로 전환
+    if (/직접\s*입력|직접\s*작성/.test(label)) {
+      pickAskCustom();
+      return;
+    }
+
+    if (q.multiSelect) {
+      // 토글: 이미 선택된 항목이면 제거, 아니면 추가
+      const current = cliPanel.multiSelections || {};
+      const stepKey = cliPanel.currentStep;
+      const set = new Set(current[stepKey] || []);
+      if (set.has(label)) {
+        set.delete(label);
+      } else {
+        set.add(label);
+      }
+      current[stepKey] = [...set];
+      cliPanel.multiSelections = current;
+      cliPanel = cliPanel;
+      return;
+    }
+
+    cliPanel.answers[q.question] = label;
     // Move to next question or enter review mode
     if (cliPanel.currentStep < cliPanel.questions.length - 1) {
       cliPanel.currentStep++;
@@ -707,6 +592,21 @@
       cliPanel.reviewing = true;
     }
     cliPanel = cliPanel; // trigger reactivity
+  }
+
+  function confirmMultiSelect() {
+    if (!cliPanel || cliPanel.type !== 'ask-user-question') return;
+    const q = cliPanel.questions[cliPanel.currentStep];
+    const selections = (cliPanel.multiSelections || {})[cliPanel.currentStep] || [];
+    if (selections.length === 0) return;
+    cliPanel.answers[q.question] = selections.join(', ');
+    if (cliPanel.currentStep < cliPanel.questions.length - 1) {
+      cliPanel.currentStep++;
+      cliPanel.selectedIndex = 0;
+    } else {
+      cliPanel.reviewing = true;
+    }
+    cliPanel = cliPanel;
   }
 
   function pickAskCustom() {
@@ -725,6 +625,20 @@
     const text = (cliPanel.customText || '').trim();
     if (!text) return;
     const q = cliPanel.questions[cliPanel.currentStep];
+
+    if (q.multiSelect) {
+      const stepKey = cliPanel.currentStep;
+      const current = cliPanel.multiSelections || {};
+      const set = new Set(current[stepKey] || []);
+      set.add(text);
+      current[stepKey] = [...set];
+      cliPanel.multiSelections = current;
+      cliPanel.showCustomInput = false;
+      cliPanel.customText = '';
+      cliPanel = cliPanel;
+      return;
+    }
+
     cliPanel.answers[q.question] = text;
     cliPanel.showCustomInput = false;
     cliPanel.customText = '';
@@ -766,6 +680,7 @@
   }
 
   async function handleSend() {
+    if (isTeamsWorkerBusy) return;
     if ((!inputMessage.trim() && attachedFiles.length === 0) || sending) return;
 
     const trimmed = inputMessage.trim();
@@ -895,18 +810,8 @@
     const retryContent = msg.content;
     const retryFiles = msg.attachments || [];
 
-    // Truncate backend conversation from this message onward
-    try {
-      await TruncateMessages(tabId, messageIndex);
-    } catch (e) {
-      console.warn('[ConversationTab] Failed to truncate messages:', e);
-    }
-
-    // Truncate local display
-    displayMessages = displayMessages.slice(0, messageIndex);
-    lastMessagesLength = displayMessages.length;
-
-    // Set up input and send
+    // "다시 보내기" = 동일 내용을 새 요청으로 추가 (기존 메시지는 그대로 유지)
+    // TruncateMessages를 호출하지 않으므로 CLI 세션과 대화 히스토리가 보존됨
     inputMessage = retryContent;
     attachedFiles = retryFiles.map(path => ({ path, name: path.split('/').pop() }));
     attachedFiles = attachedFiles;
@@ -1105,6 +1010,37 @@
     await ToggleTabPlanMode(tabId, false);
     dispatch('refresh');
     inputMessage = '위 플랜을 승인합니다. 구현을 시작해주세요. 각 단계를 빠짐없이 실행하고, 완료 후 결과를 요약해 주세요.';
+    await handleSend();
+  }
+
+  async function executePlanWithClear() {
+    const planContent = await GetPlanContent(tabId);
+    closeCliPanel();
+    planMode = false;
+    planResponseReceived = false;
+    await ToggleTabPlanMode(tabId, false);
+    await ClearConversation(tabId);
+    displayMessages = [];
+    lastMessagesLength = 0;
+    dispatch('refresh');
+    inputMessage = '다음 플랜을 승인합니다. 구현을 시작해주세요. 각 단계를 빠짐없이 실행하고, 완료 후 결과를 요약해 주세요.\n\n' + (planContent || '');
+    await handleSend();
+  }
+
+  function startPlanFeedback() {
+    cliPanel.showCustomInput = true;
+    cliPanel = cliPanel;
+    tick().then(() => {
+      const input = document.querySelector('.plan-approval-panel .ask-custom-input');
+      if (input) input.focus();
+    });
+  }
+
+  async function submitPlanFeedback() {
+    if (!cliPanel.customText?.trim()) return;
+    const feedback = cliPanel.customText.trim();
+    closeCliPanel();
+    inputMessage = feedback;
     await handleSend();
   }
 
@@ -1563,10 +1499,42 @@
     // CLI panel keyboard handling (highest priority)
     if (cliPanel) {
       // Plan execution shortcut (Cmd/Ctrl+Shift+Enter)
-      if (cliPanel.type === 'plan-ready' && event.key === 'Enter' && event.shiftKey && (event.metaKey || event.ctrlKey)) {
-        event.preventDefault();
-        executePlan();
-        return;
+      if (cliPanel.type === 'plan-ready') {
+        if (cliPanel.showCustomInput) {
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            cliPanel.showCustomInput = false;
+            cliPanel = cliPanel;
+            return;
+          }
+          return;
+        }
+        const totalItems = 4;
+        if (event.key === 'ArrowDown') {
+          event.preventDefault();
+          cliPanel.selectedIndex = (cliPanel.selectedIndex + 1) % totalItems;
+          cliPanel = cliPanel;
+          return;
+        }
+        if (event.key === 'ArrowUp') {
+          event.preventDefault();
+          cliPanel.selectedIndex = (cliPanel.selectedIndex - 1 + totalItems) % totalItems;
+          cliPanel = cliPanel;
+          return;
+        }
+        if (event.key === 'Enter' && !event.shiftKey) {
+          event.preventDefault();
+          if (cliPanel.selectedIndex === 0) executePlanWithClear();
+          else if (cliPanel.selectedIndex === 1) executePlan();
+          else if (cliPanel.selectedIndex === 2) viewPlanFile();
+          else if (cliPanel.selectedIndex === 3) startPlanFeedback();
+          return;
+        }
+        if (event.key === 'Enter' && event.shiftKey && (event.metaKey || event.ctrlKey)) {
+          event.preventDefault();
+          executePlan();
+          return;
+        }
       }
       if (cliPanel.type === 'ask-user-question' && cliPanel.showCustomInput) {
         // Custom text input mode: only handle Escape to cancel
@@ -1596,9 +1564,24 @@
         }
         if (event.key === 'Enter' && !event.metaKey && !event.ctrlKey) {
           event.preventDefault();
-          if (cliPanel.selectedIndex === q.options.length) {
-            pickAskCustom();
+          if (q.multiSelect) {
+            if (cliPanel.selectedIndex === q.options.length) {
+              pickAskCustom();
+            } else {
+              confirmMultiSelect();
+            }
           } else {
+            if (cliPanel.selectedIndex === q.options.length) {
+              pickAskCustom();
+            } else {
+              pickAskOption(cliPanel.selectedIndex);
+            }
+          }
+          return;
+        }
+        if (event.key === ' ' && q.multiSelect) {
+          event.preventDefault();
+          if (cliPanel.selectedIndex < q.options.length) {
             pickAskOption(cliPanel.selectedIndex);
           }
           return;
@@ -1638,44 +1621,28 @@
         }
         return;
       }
-      if (cliPanel.type === 'model-select' || cliPanel.type === 'choice') {
-        const items = cliPanel.type === 'model-select' ? cliPanel.models : cliPanel.choices;
-        const totalItems = cliPanel.type === 'choice' ? items.length + 1 : items.length; // +1 for "Other"
+      if (cliPanel.type === 'model-select') {
+        const totalItems = cliPanel.models.length;
 
-        // 커스텀 입력 중이면 키보드를 입력 필드에 위임
-        if (cliPanel.type === 'choice' && cliPanel.showCustomInput) {
-          if (event.key === 'Escape') {
-            event.preventDefault();
-            cliPanel.showCustomInput = false;
-            cliPanel = cliPanel;
-            return;
-          }
-          return; // 나머지 키는 input에 위임
-        }
+        // cliPanel 내부에 포커스가 있을 때만 방향키/Enter로 선택지 조작
+        const ae_nav = document.activeElement;
+        const cliPanelFocused = cliPanelEl && (cliPanelEl === ae_nav || cliPanelEl.contains(ae_nav));
 
-        // textarea에 포커스가 있으면 방향키는 textarea가 처리 (히스토리 탐색 등)
-        const textareaFocused = document.activeElement === textareaEl;
-        if (event.key === 'ArrowDown' && !textareaFocused) {
+        if (event.key === 'ArrowDown' && cliPanelFocused) {
           event.preventDefault();
           cliPanelSelectedIndex = (cliPanelSelectedIndex + 1) % totalItems;
           return;
         }
-        if (event.key === 'ArrowUp' && !textareaFocused) {
+        if (event.key === 'ArrowUp' && cliPanelFocused) {
           event.preventDefault();
           cliPanelSelectedIndex = (cliPanelSelectedIndex - 1 + totalItems) % totalItems;
           return;
         }
         if (event.key === 'Enter' && !event.metaKey && !event.ctrlKey) {
-          event.preventDefault();
-          // If textarea has focus and content, send message instead of selecting choice
-          if (document.activeElement === textareaEl && inputMessage.trim()) {
-            handleSend();
-            return;
-          }
-          if (cliPanel.type === 'model-select') {
+          if (cliPanelFocused) {
+            event.preventDefault();
             selectModel();
-          } else if (cliPanel.type === 'choice') {
-            selectChoice();
+            return;
           }
           return;
         }
@@ -1925,39 +1892,6 @@
           {/each}
         </div>
         <div class="cli-hint">↑↓ 이동 · Enter 선택 · Esc 취소</div>
-      {:else if cliPanel.type === 'choice'}
-        <div class="cli-title">{cliPanel.question}</div>
-        <div class="cli-options">
-          {#each cliPanel.choices as choice, i}
-            <div
-              class="cli-option"
-              class:selected={i === cliPanelSelectedIndex}
-              on:click={() => { cliPanelSelectedIndex = i; selectChoice(); }}
-            >
-              <span class="cli-cursor">{i === cliPanelSelectedIndex ? '❯' : ' '}</span>
-              <span class="cli-choice-num">{choice.num}</span>
-              <span class="cli-choice-text"><MarkdownViewer content={choice.text} /></span>
-            </div>
-          {/each}
-          <!-- Other (custom text) option -->
-          <div class="cli-option"
-               class:selected={cliPanelSelectedIndex === cliPanel.choices.length}
-               on:click={() => { cliPanelSelectedIndex = cliPanel.choices.length; selectChoice(); }}>
-            <span class="cli-cursor">{cliPanelSelectedIndex === cliPanel.choices.length ? '❯' : ' '}</span>
-            <span class="cli-choice-num">✎</span>
-            <span class="cli-choice-text">기타 (직접 입력)</span>
-          </div>
-          {#if cliPanel.showCustomInput}
-            <div class="ask-custom-row">
-              <input class="ask-custom-input cli-custom-input"
-                     bind:value={cliPanel.customText}
-                     on:keydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); submitChoiceCustom(); } }}
-                     placeholder="답변을 입력하세요..." />
-              <button class="ask-custom-submit" on:click={submitChoiceCustom}>OK</button>
-            </div>
-          {/if}
-        </div>
-        <div class="cli-hint">↑↓ 이동 · Enter 선택 · Esc 취소</div>
       {:else if cliPanel.type === 'ask-user-question'}
         <div class="ask-panel">
           <div class="ask-progress">
@@ -1983,7 +1917,11 @@
                 <div class="cli-option"
                      class:selected={i === cliPanel.selectedIndex}
                      on:click={() => pickAskOption(i)}>
-                  <span class="cli-cursor">{i === cliPanel.selectedIndex ? '❯' : ' '}</span>
+                  {#if q.multiSelect}
+                    <span class="cli-cursor">{(cliPanel.multiSelections?.[cliPanel.currentStep] || []).includes(opt.label) ? '☑' : '☐'}</span>
+                  {:else}
+                    <span class="cli-cursor">{i === cliPanel.selectedIndex ? '❯' : ' '}</span>
+                  {/if}
                   <div class="ask-opt-content">
                     <span class="ask-opt-label">{opt.label}</span>
                     {#if opt.description}
@@ -1998,8 +1936,8 @@
                    on:click={pickAskCustom}>
                 <span class="cli-cursor">{cliPanel.selectedIndex === q.options.length ? '❯' : ' '}</span>
                 <div class="ask-opt-content">
-                  <span class="ask-opt-label">Other</span>
-                  <span class="ask-opt-desc">Type a custom answer</span>
+                  <span class="ask-opt-label">직접 입력</span>
+                  <span class="ask-opt-desc">텍스트로 답변 작성</span>
                 </div>
               </div>
               {#if cliPanel.showCustomInput}
@@ -2011,14 +1949,59 @@
                   <button class="ask-custom-submit" on:click={submitCustomAnswer}>OK</button>
                 </div>
               {/if}
+              {#if q.multiSelect}
+                <button class="ask-confirm-multi"
+                        disabled={!(cliPanel.multiSelections?.[cliPanel.currentStep]?.length)}
+                        on:click={confirmMultiSelect}>
+                  선택 완료 ({(cliPanel.multiSelections?.[cliPanel.currentStep] || []).length}개)
+                </button>
+              {/if}
             </div>
-            <div class="cli-hint">↑↓ 이동 · Enter 선택 · ← 이전 · → 다음</div>
+            {#if q.multiSelect}
+              <div class="cli-hint">↑↓ 이동 · Space 선택/해제 · Enter 확정 · ← 이전</div>
+            {:else}
+              <div class="cli-hint">↑↓ 이동 · Enter 선택 · ← 이전 · → 다음</div>
+            {/if}
           {:else}
             <div class="ask-review">
-              {#each cliPanel.questions as q}
-                <div class="ask-review-item">
+              {#each cliPanel.questions as q, i}
+                <div class="ask-review-item ask-review-editable">
                   <span class="ask-review-q">{q.question}</span>
-                  <span class="ask-review-a">→ {cliPanel.answers[q.question]}</span>
+                  {#if cliPanel.editingIndex === i}
+                    <div class="ask-review-inline-edit">
+                      <input class="ask-inline-input"
+                             value={cliPanel.answers[q.question] || ''}
+                             on:keydown={(e) => {
+                               if (e.key === 'Enter') {
+                                 e.preventDefault();
+                                 const val = e.target.value.trim();
+                                 if (val) cliPanel.answers[q.question] = val;
+                                 cliPanel.editingIndex = -1;
+                                 cliPanel = cliPanel;
+                               } else if (e.key === 'Escape') {
+                                 cliPanel.editingIndex = -1;
+                                 cliPanel = cliPanel;
+                               }
+                             }}
+                             placeholder="답변을 입력하세요..." />
+                      <button class="ask-inline-ok" on:click={(e) => {
+                        const input = e.target.parentElement.querySelector('.ask-inline-input');
+                        const val = (input?.value || '').trim();
+                        if (val) cliPanel.answers[q.question] = val;
+                        cliPanel.editingIndex = -1;
+                        cliPanel = cliPanel;
+                      }}>OK</button>
+                    </div>
+                  {:else}
+                    <span class="ask-review-a" on:click={() => {
+                      cliPanel.editingIndex = i;
+                      cliPanel = cliPanel;
+                      tick().then(() => {
+                        const el = document.querySelector('.ask-inline-input');
+                        if (el) { el.focus(); el.select(); }
+                      });
+                    }}>→ {cliPanel.answers[q.question]} <span class="ask-review-edit">수정</span></span>
+                  {/if}
                 </div>
               {/each}
             </div>
@@ -2033,13 +2016,54 @@
           <MarkdownViewer content={cliPanel.content} />
         </div>
       {:else if cliPanel.type === 'plan-ready'}
-        <div class="cli-plan-ready">
-          <span class="plan-ready-text">플랜이 준비되었습니다</span>
-          <button class="plan-view-btn" on:click={viewPlanFile}>플랜 파일 보기</button>
-          <button class="plan-execute-btn" on:click={executePlan}>
-            플랜 실행 <span class="shortcut-hint">{isMac ? '⌘' : 'Ctrl'}⇧↵</span>
-          </button>
-          <span class="plan-ready-hint">또는 추가 요청을 입력하세요</span>
+        <div class="plan-approval-panel">
+          <div class="plan-approval-header">
+            플랜이 준비되었습니다. 어떻게 진행할까요?
+          </div>
+          <div class="cli-options">
+            <div class="cli-option" class:selected={cliPanel.selectedIndex === 0}
+                 on:click={() => executePlanWithClear()}>
+              <span class="cli-cursor">{cliPanel.selectedIndex === 0 ? '❯' : ' '}</span>
+              <div class="ask-opt-content">
+                <span class="ask-opt-label">승인 - 컨텍스트 초기화 ({contextPercent}% 사용됨)</span>
+                <span class="ask-opt-desc">새 세션에서 플랜만으로 실행 (추천)</span>
+              </div>
+            </div>
+            <div class="cli-option" class:selected={cliPanel.selectedIndex === 1}
+                 on:click={() => executePlan()}>
+              <span class="cli-cursor">{cliPanel.selectedIndex === 1 ? '❯' : ' '}</span>
+              <div class="ask-opt-content">
+                <span class="ask-opt-label">승인 - 현재 컨텍스트 유지</span>
+                <span class="ask-opt-desc">기존 대화를 유지하며 플랜 실행</span>
+              </div>
+            </div>
+            <div class="cli-option" class:selected={cliPanel.selectedIndex === 2}
+                 on:click={() => viewPlanFile()}>
+              <span class="cli-cursor">{cliPanel.selectedIndex === 2 ? '❯' : ' '}</span>
+              <div class="ask-opt-content">
+                <span class="ask-opt-label">플랜 파일 보기</span>
+                <span class="ask-opt-desc">실행 전 플랜 내용 확인</span>
+              </div>
+            </div>
+            <div class="cli-option" class:selected={cliPanel.selectedIndex === 3}
+                 on:click={() => startPlanFeedback()}>
+              <span class="cli-cursor">{cliPanel.selectedIndex === 3 ? '❯' : ' '}</span>
+              <div class="ask-opt-content">
+                <span class="ask-opt-label">수정 요청</span>
+                <span class="ask-opt-desc">플랜 변경사항을 직접 입력</span>
+              </div>
+            </div>
+            {#if cliPanel.showCustomInput}
+              <div class="ask-custom-row">
+                <input class="ask-custom-input"
+                       bind:value={cliPanel.customText}
+                       on:keydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); submitPlanFeedback(); } }}
+                       placeholder="수정할 내용을 입력하세요..." />
+                <button class="ask-custom-submit" on:click={submitPlanFeedback}>OK</button>
+              </div>
+            {/if}
+          </div>
+          <div class="cli-hint">↑↓ 이동 · Enter 선택 · {isMac ? '⌘' : 'Ctrl'}⇧↵ 바로 실행</div>
         </div>
       {:else if cliPanel.type === 'plan-viewer'}
         <div class="cli-plan-viewer">
@@ -2074,7 +2098,7 @@
                 ○
               {/if}
             </span>
-            <span class="task-worker">{task.workerTabId}</span>
+            <span class="task-worker">{workerTabNames[task.workerTabId] || task.workerTabId}</span>
             <span class="task-desc">{task.description}</span>
           </div>
         {/each}
@@ -2085,114 +2109,120 @@
     </div>
   {/if}
 
-  <div class="input-splitter" class:active={inputResizing} on:mousedown={startInputResize}></div>
-
-  <div class="input-area" style="height: {inputAreaHeight}px;">
-    {#if showPopup}
-      <SlashCommandPopup
-        commands={popupCommands}
-        bind:selectedIndex={popupSelectedIndex}
-        on:select={handlePopupSelect}
-      />
-    {/if}
-
-    {#if showFilePopup}
-      <FilePathPopup
-        items={filePopupItems}
-        bind:selectedIndex={filePopupSelectedIndex}
-        on:select={(e) => selectFilePath(e.detail)}
-        on:navigate={(e) => navigateFileDir(e.detail)}
-      />
-    {/if}
-
-    <div class="input-controls">
-      <label class="admin-mode-toggle">
-        <input
-          type="checkbox"
-          bind:checked={adminMode}
-          on:change={toggleAdminMode}
-        />
-        <span>관리자 모드</span>
-      </label>
-      <label class="teams-mode-toggle" class:active={teamsMode}>
-        <input
-          type="checkbox"
-          bind:checked={teamsMode}
-          on:change={toggleTeamsMode}
-        />
-        <span>Teams (Beta)</span>
-      </label>
-      <label class="plan-mode-toggle" class:active={planMode}>
-        <input
-          type="checkbox"
-          bind:checked={planMode}
-          on:change={togglePlanMode}
-        />
-        <span>Plan 모드</span>
-      </label>
-      <button class="attach-btn" on:click={handleFileSelect} title="파일 첨부">
-        📎 파일 첨부
-      </button>
-      {#if isGitRepo}
-        <button class="review-btn" on:click={requestCodeReview} title="AI 코드 리뷰">
-          리뷰
-        </button>
-        <button class="commit-btn" on:click|stopPropagation title="Git Commit">
-          Commit
-        </button>
-      {/if}
+  {#if isTeamsWorkerBusy}
+    <div class="input-area-collapsed">
+      <span class="worker-busy-label">Teams 오케스트레이션 실행 중...</span>
     </div>
+  {:else}
+    <div class="input-splitter" class:active={inputResizing} on:mousedown={startInputResize}></div>
 
-    {#if attachedFiles.length > 0}
-      <div class="attached-files">
-        {#each attachedFiles as file, index}
-          <div class="file-item">
-            {#if file.preview}
-              <img src={file.preview} alt={file.name} class="file-preview" />
-            {:else}
-              <div class="file-icon-badge">
-                <span class="file-ext">{file.name.split('.').pop()}</span>
-              </div>
-            {/if}
-            <div class="file-info">
-              <span class="file-name">{file.name}</span>
-              <span class="file-path">{shortenPath(file.path)}</span>
-            </div>
-            {#if !file.preview}
-              <input class="line-range-input" placeholder="예: 10-30"
-                     bind:value={file.lineRange}
-                     on:change={() => attachedFiles = attachedFiles} />
-            {/if}
-            <button class="remove-file" on:click={() => removeFile(index)} title="제거">✕</button>
-          </div>
-        {/each}
+    <div class="input-area" style="height: {inputAreaHeight}px;">
+      {#if showPopup}
+        <SlashCommandPopup
+          commands={popupCommands}
+          bind:selectedIndex={popupSelectedIndex}
+          on:select={handlePopupSelect}
+        />
+      {/if}
+
+      {#if showFilePopup}
+        <FilePathPopup
+          items={filePopupItems}
+          bind:selectedIndex={filePopupSelectedIndex}
+          on:select={(e) => selectFilePath(e.detail)}
+          on:navigate={(e) => navigateFileDir(e.detail)}
+        />
+      {/if}
+
+      <div class="input-controls">
+        <label class="admin-mode-toggle">
+          <input
+            type="checkbox"
+            bind:checked={adminMode}
+            on:change={toggleAdminMode}
+          />
+          <span>관리자 모드</span>
+        </label>
+        <label class="teams-mode-toggle" class:active={teamsMode}>
+          <input
+            type="checkbox"
+            bind:checked={teamsMode}
+            on:change={toggleTeamsMode}
+          />
+          <span>Teams (Beta)</span>
+        </label>
+        <label class="plan-mode-toggle" class:active={planMode}>
+          <input
+            type="checkbox"
+            bind:checked={planMode}
+            on:change={togglePlanMode}
+          />
+          <span>Plan 모드</span>
+        </label>
+        <button class="attach-btn" on:click={handleFileSelect} title="파일 첨부">
+          📎 파일 첨부
+        </button>
+        {#if isGitRepo}
+          <button class="review-btn" on:click={requestCodeReview} title="AI 코드 리뷰">
+            리뷰
+          </button>
+          <button class="commit-btn" on:click|stopPropagation title="Git Commit">
+            Commit
+          </button>
+        {/if}
       </div>
-    {/if}
 
-    <div class="input-row">
-      <textarea
-        bind:this={textareaEl}
-        bind:value={inputMessage}
-        on:keydown={handleKeydown}
-        on:input={handleInput}
-        placeholder={currentPlaceholder}
-        rows="5"
-        spellcheck="false"
-        autocorrect="off"
-        autocapitalize="off"
-        autocomplete="off"
-      />
-      {#if sending}
-        <button class="stop-btn" on:click={handleCancel} title="생성 중지 (Esc)">
-          ■ 중지
-        </button>
-      {:else}
-        <button on:click={handleSend} disabled={!inputMessage.trim() && attachedFiles.length === 0} title="전송 ({isMac ? '⌘' : 'Ctrl'}+Enter)">
-          전송 <span class="shortcut-hint">{isMac ? '⌘' : 'Ctrl'}↵</span>
-        </button>
+      {#if attachedFiles.length > 0}
+        <div class="attached-files">
+          {#each attachedFiles as file, index}
+            <div class="file-item">
+              {#if file.preview}
+                <img src={file.preview} alt={file.name} class="file-preview" />
+              {:else}
+                <div class="file-icon-badge">
+                  <span class="file-ext">{file.name.split('.').pop()}</span>
+                </div>
+              {/if}
+              <div class="file-info">
+                <span class="file-name">{file.name}</span>
+                <span class="file-path">{shortenPath(file.path)}</span>
+              </div>
+              {#if !file.preview}
+                <input class="line-range-input" placeholder="예: 10-30"
+                       bind:value={file.lineRange}
+                       on:change={() => attachedFiles = attachedFiles} />
+              {/if}
+              <button class="remove-file" on:click={() => removeFile(index)} title="제거">✕</button>
+            </div>
+          {/each}
+        </div>
       {/if}
+
+      <div class="input-row">
+        <textarea
+          bind:this={textareaEl}
+          bind:value={inputMessage}
+          on:keydown={handleKeydown}
+          on:input={handleInput}
+          placeholder={currentPlaceholder}
+          rows="5"
+          spellcheck="false"
+          autocorrect="off"
+          autocapitalize="off"
+          autocomplete="off"
+        />
+        {#if sending}
+          <button class="stop-btn" on:click={handleCancel} title="생성 중지 (Esc)">
+            ■ 중지
+          </button>
+        {:else}
+          <button on:click={handleSend} disabled={!inputMessage.trim() && attachedFiles.length === 0} title="전송 ({isMac ? '⌘' : 'Ctrl'}+Enter)">
+            전송 <span class="shortcut-hint">{isMac ? '⌘' : 'Ctrl'}↵</span>
+          </button>
+        {/if}
+      </div>
     </div>
-  </div>
+  {/if}
 </div>
 
 {#if lightboxSrc}
@@ -2637,37 +2667,8 @@
     color: var(--accent);
   }
 
-  .cli-choice-num {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 18px;
-    height: 18px;
-    border-radius: 50%;
-    background-color: var(--accent);
-    color: var(--text-inverse);
-    font-size: 10px;
-    font-weight: 700;
-    flex-shrink: 0;
-  }
-
   .cli-model-name {
     flex: 1;
-  }
-
-  .cli-choice-text {
-    flex: 1;
-    min-width: 0;
-  }
-
-  /* Flatten MarkdownViewer output inside choice items */
-  .cli-choice-text :global(p) {
-    margin: 0;
-    display: inline;
-  }
-
-  .cli-choice-text :global(strong) {
-    color: var(--text-primary);
   }
 
   .cli-badge {
@@ -2690,55 +2691,15 @@
     line-height: 1.5;
   }
 
-  .cli-plan-ready {
-    display: flex;
-    align-items: center;
-    gap: 12px;
+  .plan-approval-panel {
     padding: 10px 16px;
   }
 
-  .plan-ready-text {
+  .plan-approval-header {
     color: var(--text-primary);
     font-size: 13px;
     font-weight: 500;
-  }
-
-  .plan-execute-btn {
-    padding: 6px 16px;
-    background-color: #7c3aed;
-    color: #ffffff;
-    border: none;
-    border-radius: 4px;
-    font-size: 13px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background-color 0.2s;
-  }
-
-  .plan-execute-btn:hover {
-    background-color: #6d28d9;
-  }
-
-  .plan-ready-hint {
-    color: var(--text-muted);
-    font-size: 11px;
-    margin-left: auto;
-  }
-
-  .plan-view-btn {
-    padding: 6px 12px;
-    background-color: transparent;
-    color: #a78bfa;
-    border: 1px solid #7c3aed;
-    border-radius: 4px;
-    font-size: 12px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: background-color 0.2s;
-  }
-
-  .plan-view-btn:hover {
-    background-color: rgba(124, 58, 237, 0.15);
+    margin-bottom: 8px;
   }
 
   .cli-plan-viewer {
@@ -2915,6 +2876,21 @@
     filter: brightness(1.1);
   }
 
+  .ask-confirm-multi {
+    margin-top: 6px;
+    padding: 4px 14px;
+    background: var(--accent, #7c3aed);
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  .ask-confirm-multi:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+
   .ask-review {
     display: flex;
     flex-direction: column;
@@ -2931,6 +2907,27 @@
     background-color: var(--bg-hover);
   }
 
+  .ask-review-editable {
+    cursor: pointer;
+    transition: background-color 0.15s;
+  }
+
+  .ask-review-editable:hover {
+    background-color: var(--bg-active, rgba(255,255,255,0.08));
+  }
+
+  .ask-review-edit {
+    font-size: 10px;
+    color: var(--text-muted);
+    opacity: 0;
+    margin-left: 6px;
+    transition: opacity 0.15s;
+  }
+
+  .ask-review-editable:hover .ask-review-edit {
+    opacity: 1;
+  }
+
   .ask-review-q {
     color: var(--text-muted);
     font-size: 11px;
@@ -2940,6 +2937,36 @@
     color: var(--accent);
     font-size: 13px;
     font-weight: 500;
+    cursor: pointer;
+  }
+
+  .ask-review-inline-edit {
+    display: flex;
+    gap: 6px;
+    margin-top: 2px;
+  }
+
+  .ask-inline-input {
+    flex: 1;
+    background: var(--bg-main, #1a1a2e);
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    color: var(--text-main);
+    padding: 4px 8px;
+    font-size: 13px;
+    font-family: inherit;
+    outline: none;
+  }
+
+  .ask-inline-ok {
+    background: var(--accent);
+    color: var(--bg-main, #000);
+    border: none;
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
   }
 
   .ask-actions {
@@ -2995,6 +3022,23 @@
   :global(body.input-resizing) {
     user-select: none;
     cursor: row-resize;
+  }
+
+  .input-area-collapsed {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 8px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-size: 12px;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+
+  .worker-busy-label {
+    opacity: 0.7;
   }
 
   .input-area {

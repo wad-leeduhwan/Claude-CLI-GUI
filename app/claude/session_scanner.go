@@ -34,14 +34,57 @@ func EncodeProjectPath(absPath string) string {
 	return strings.ReplaceAll(absPath, "/", "-")
 }
 
-// DecodeProjectPath reverses EncodeProjectPath:
-// "-Users-cat-proj" → "/Users/cat/proj"
+// DecodeProjectPath reverses EncodeProjectPath by testing each hyphen position
+// as either a literal hyphen or a directory separator, using filesystem validation.
+// Falls back to naive all-hyphens-to-slashes if reconstruction fails.
 func DecodeProjectPath(encoded string) string {
 	if encoded == "" {
 		return ""
 	}
-	// encoded always starts with "-" (from leading "/")
+	parts := strings.Split(encoded[1:], "-") // remove leading "-"
+	if len(parts) == 0 {
+		return "/"
+	}
+	if result := reconstructPath("/"+parts[0], parts[1:]); result != "" {
+		return result
+	}
 	return strings.ReplaceAll(encoded, "-", "/")
+}
+
+// reconstructPath tries all possible interpretations of hyphens as either
+// literal hyphens or directory separators, validating against the filesystem.
+// For final segments: tries hyphen first (preserves hyphenated names).
+// For non-final segments: tries both slash and hyphen-accumulation branches.
+func reconstructPath(current string, remaining []string) string {
+	if len(remaining) == 0 {
+		if _, err := os.Stat(current); err == nil {
+			return current
+		}
+		return ""
+	}
+
+	next := remaining[0]
+	rest := remaining[1:]
+
+	withSlash := current + "/" + next
+	withHyphen := current + "-" + next
+
+	if len(rest) == 0 {
+		// Final segment: try hyphen first (preserves literal hyphens), then slash
+		if r := reconstructPath(withHyphen, nil); r != "" {
+			return r
+		}
+		return reconstructPath(withSlash, nil)
+	}
+
+	// Non-final: try slash branch (recurse even if intermediate isn't a dir yet,
+	// because later segments may accumulate with hyphens to form valid dir names)
+	if r := reconstructPath(withSlash, rest); r != "" {
+		return r
+	}
+
+	// Non-final: accumulate with hyphen
+	return reconstructPath(withHyphen, rest)
 }
 
 // ListSessions scans ~/.claude/projects/{encoded}/ for *.jsonl files
@@ -94,7 +137,14 @@ func ListAllSessions(currentWorkDir string) ([]SessionInfo, error) {
 
 		dirName := dir.Name()
 		projectDir := filepath.Join(projectsRoot, dirName)
-		projectPath := DecodeProjectPath(dirName)
+
+		var projectPath string
+		if dirName == currentEncoded {
+			// For current project, use the known-correct workDir
+			projectPath = currentWorkDir
+		} else {
+			projectPath = DecodeProjectPath(dirName)
+		}
 
 		sessions, err := scanProjectDir(projectDir, projectPath)
 		if err != nil {

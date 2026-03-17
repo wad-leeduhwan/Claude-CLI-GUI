@@ -496,6 +496,22 @@ func extractToolDetail(toolName string, input json.RawMessage) string {
 		if q, ok := raw["query"].(string); ok {
 			return q
 		}
+	case "Agent":
+		if st, ok := raw["subagent_type"].(string); ok {
+			return st
+		}
+		if d, ok := raw["description"].(string); ok {
+			if len(d) > 60 {
+				d = d[:60] + "..."
+			}
+			return d
+		}
+		if p, ok := raw["prompt"].(string); ok {
+			if len(p) > 60 {
+				p = p[:60] + "..."
+			}
+			return p
+		}
 	case "Task":
 		if d, ok := raw["description"].(string); ok {
 			if len(d) > 60 {

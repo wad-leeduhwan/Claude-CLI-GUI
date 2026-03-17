@@ -4,8 +4,6 @@ function createAgentStore() {
   const { subscribe, update } = writable({
     tabRenames: {},           // tabID → suggestedName
     projectSummaries: {},     // workDir → { summary, language, framework }
-    claudeMdSuggestions: {},  // workDir → content string
-    contextRecommendations: {}, // tabID → [file paths]
     codeReviews: {}              // tabID → { issues: [...], summary: "..." }
   });
 
@@ -36,34 +34,6 @@ function createAgentStore() {
     clearProjectSummary(workDir) {
       update(s => {
         delete s.projectSummaries[workDir];
-        return { ...s };
-      });
-    },
-
-    setClaudeMdSuggestion(workDir, content) {
-      update(s => {
-        s.claudeMdSuggestions[workDir] = content;
-        return { ...s };
-      });
-    },
-
-    clearClaudeMdSuggestion(workDir) {
-      update(s => {
-        delete s.claudeMdSuggestions[workDir];
-        return { ...s };
-      });
-    },
-
-    setContextRecommendation(tabID, files) {
-      update(s => {
-        s.contextRecommendations[tabID] = files;
-        return { ...s };
-      });
-    },
-
-    clearContextRecommendation(tabID) {
-      update(s => {
-        delete s.contextRecommendations[tabID];
         return { ...s };
       });
     },

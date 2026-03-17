@@ -106,7 +106,16 @@ func (a *App) startup(ctx context.Context) {
 		if state, err := a.store.Load(); err == nil && state != nil && len(state.Tabs) > 0 {
 			for _, tab := range state.Tabs {
 				tab.Orchestrator = nil // ephemeral, not restored
-				tab.TeamsState = nil   // ephemeral, not restored
+				// Reinitialize TeamsState if TeamsMode was enabled
+				if tab.TeamsMode {
+					tab.TeamsState = &models.TeamsState{
+						ConnectedTabs: []string{},
+						AgentMapping:  make(map[string]string),
+						IsRunning:     false,
+					}
+				} else {
+					tab.TeamsState = nil
+				}
 				if tab.Messages == nil {
 					tab.Messages = []models.Message{}
 				}
@@ -134,6 +143,21 @@ func (a *App) startup(ctx context.Context) {
 					}
 				}
 				a.claude.ImportSessions(cliMappings)
+			}
+			// Validate WorkDir: if it doesn't exist on disk, try to reconstruct
+			// the correct path from the encoded directory name (fixes hyphen corruption)
+			for _, tab := range state.Tabs {
+				if tab.WorkDir == "" {
+					continue
+				}
+				if _, err := os.Stat(tab.WorkDir); err != nil {
+					encoded := claude.EncodeProjectPath(tab.WorkDir)
+					decoded := claude.DecodeProjectPath(encoded)
+					if decoded != tab.WorkDir {
+						fmt.Printf("[App.startup] Fixed WorkDir for tab %s: %q → %q\n", tab.ID, tab.WorkDir, decoded)
+						tab.WorkDir = decoded
+					}
+				}
 			}
 			restored = true
 			fmt.Printf("[App.startup] Restored %d tabs from state.json\n", len(state.Tabs))
@@ -584,8 +608,8 @@ func (a *App) SendMessage(tabID, message string, files []string) error {
 				contextParts = append(contextParts, "User: "+msg.Content)
 			} else if msg.Role == "assistant" {
 				content := msg.Content
-				if len(content) > 500 {
-					content = content[:500] + "... [truncated]"
+				if len(content) > 4000 {
+					content = content[:4000] + "... [truncated]"
 				}
 				contextParts = append(contextParts, "Assistant: "+content)
 			}
@@ -604,7 +628,9 @@ func (a *App) SendMessage(tabID, message string, files []string) error {
 	guiContext := "You are running inside a GUI chat application. " +
 		"IMPORTANT: When you need to ask the user a question, clarify requirements, or let the user choose between approaches, " +
 		"you MUST ALWAYS use the AskUserQuestion tool. NEVER output questions as plain numbered lists or bullet points in plain text. " +
+		"This includes yes/no confirmations, approach selection, and any decision that requires user input. " +
 		"The GUI renders AskUserQuestion as an interactive selection UI with clickable options. " +
+		"Plain-text numbered lists or bullet-point options will NOT be rendered as interactive UI — only AskUserQuestion works. " +
 		"If the user's request is ambiguous or multiple approaches are possible, use AskUserQuestion BEFORE taking action. " +
 		"The user will respond in the next message."
 
@@ -612,7 +638,7 @@ func (a *App) SendMessage(tabID, message string, files []string) error {
 	var tools string // empty = all tools (default)
 
 	if tab.PlanMode {
-		permissionMode = "plan"
+		permissionMode = "bypassPermissions"
 		systemPrompt = guiContext + "\n\n[PLAN MODE] You are in read-only plan mode. You MUST NOT modify any files.\n" +
 			"Follow this workflow thoroughly:\n\n" +
 			"1. EXPLORE PHASE: Use Task tool with subagent_type='Explore' to deeply analyze the codebase. " +
@@ -622,8 +648,7 @@ func (a *App) SendMessage(tabID, message string, files []string) error {
 			"Consider multiple perspectives and trade-offs.\n\n" +
 			"3. CLARIFICATION: If the user's request is ambiguous or you need decisions, " +
 			"STOP and ask the user BEFORE proceeding. Do NOT assume — always ask.\n" +
-			"Format questions with numbered options so the user can click to choose:\n" +
-			"Example:\n어떤 방식을 사용할까요?\n1. Option A description\n2. Option B description\n3. Option C description\n\n" +
+			"ALWAYS use the AskUserQuestion tool — never output questions as plain numbered lists.\n\n" +
 			"4. FINAL PLAN: Present a detailed implementation plan including:\n" +
 			"   - Context: why this change is needed\n" +
 			"   - Files to modify with specific line ranges and changes\n" +
@@ -1497,6 +1522,13 @@ func (a *App) CancelOrchestrationJob(adminTabID string) error {
 		}
 	}
 
+	// Teams 모드: 모든 연결된 워커에 스트리밍 종료 전송
+	if tabExists && adminTab.TeamsMode && adminTab.TeamsState != nil {
+		for _, workerTabID := range adminTab.TeamsState.ConnectedTabs {
+			a.wsServer.SendStreamEnd(workerTabID)
+		}
+	}
+
 	fmt.Printf("[App.CancelOrchestrationJob] Cancelled orchestration for admin tab: %s\n", adminTabID)
 	return nil
 }
@@ -1525,19 +1557,13 @@ func (a *App) ToggleTabTeamsMode(tabID string, enabled bool) error {
 		tab.AdminMode = false
 		tab.Orchestrator = nil
 
-		// Initialize teams state with all other tabs as workers
-		connectedTabs := []string{}
-		for _, t := range a.tabs {
-			if t.ID != tabID {
-				connectedTabs = append(connectedTabs, t.ID)
-			}
-		}
+		// Initialize teams state with empty workers (user selects manually)
 		tab.TeamsState = &models.TeamsState{
-			ConnectedTabs: connectedTabs,
+			ConnectedTabs: []string{},
 			AgentMapping:  make(map[string]string),
 			IsRunning:     false,
 		}
-		fmt.Printf("[App.ToggleTabTeamsMode] Teams mode enabled for %s, connected workers: %v\n", tabID, connectedTabs)
+		fmt.Printf("[App.ToggleTabTeamsMode] Teams mode enabled for %s, starting with empty workers\n", tabID)
 	} else {
 		tab.TeamsState = nil
 		fmt.Printf("[App.ToggleTabTeamsMode] Teams mode disabled for %s\n", tabID)
@@ -1599,6 +1625,137 @@ func (a *App) DisconnectTeamsWorker(teamTabID, workerTabID string) error {
 	}
 
 	return nil
+}
+
+// GetTeamPresets returns all saved team presets
+func (a *App) GetTeamPresets() []models.TeamPreset {
+	a.tabsMu.RLock()
+	defer a.tabsMu.RUnlock()
+
+	if a.settings.TeamPresets == nil {
+		return []models.TeamPreset{}
+	}
+	return a.settings.TeamPresets
+}
+
+// SaveTeamPreset saves the current team's connected workers as a named preset
+func (a *App) SaveTeamPreset(teamTabID, presetName string) error {
+	a.tabsMu.Lock()
+	defer a.tabsMu.Unlock()
+
+	teamTab, exists := a.tabs[teamTabID]
+	if !exists {
+		return fmt.Errorf("team tab not found: %s", teamTabID)
+	}
+	if !teamTab.TeamsMode || teamTab.TeamsState == nil {
+		return fmt.Errorf("tab %s is not in teams mode", teamTabID)
+	}
+
+	// Convert connected tab IDs to tab names
+	workerNames := []string{}
+	for _, workerID := range teamTab.TeamsState.ConnectedTabs {
+		if wTab, ok := a.tabs[workerID]; ok {
+			workerNames = append(workerNames, wTab.Name)
+		}
+	}
+
+	preset := models.TeamPreset{
+		ID:          fmt.Sprintf("preset-%d", time.Now().UnixNano()),
+		Name:        presetName,
+		WorkerNames: workerNames,
+		CreatedAt:   time.Now().Unix(),
+	}
+
+	if a.settings.TeamPresets == nil {
+		a.settings.TeamPresets = []models.TeamPreset{}
+	}
+	a.settings.TeamPresets = append(a.settings.TeamPresets, preset)
+
+	fmt.Printf("[App.SaveTeamPreset] Saved preset '%s' with workers: %v\n", presetName, workerNames)
+	go a.saveState()
+	return nil
+}
+
+// ApplyTeamPreset applies a saved preset to a teams tab by matching worker names to current tabs
+func (a *App) ApplyTeamPreset(teamTabID, presetID string) error {
+	a.tabsMu.Lock()
+	defer a.tabsMu.Unlock()
+
+	teamTab, exists := a.tabs[teamTabID]
+	if !exists {
+		return fmt.Errorf("team tab not found: %s", teamTabID)
+	}
+	if !teamTab.TeamsMode || teamTab.TeamsState == nil {
+		return fmt.Errorf("tab %s is not in teams mode", teamTabID)
+	}
+	if teamTab.TeamsState.IsRunning {
+		return fmt.Errorf("cannot apply preset while teams is running")
+	}
+
+	// Find the preset
+	var preset *models.TeamPreset
+	for i := range a.settings.TeamPresets {
+		if a.settings.TeamPresets[i].ID == presetID {
+			preset = &a.settings.TeamPresets[i]
+			break
+		}
+	}
+	if preset == nil {
+		return fmt.Errorf("preset not found: %s", presetID)
+	}
+
+	// Match worker names to current tab IDs
+	connectedTabs := []string{}
+	for _, name := range preset.WorkerNames {
+		for _, t := range a.tabs {
+			if t.Name == name && t.ID != teamTabID {
+				connectedTabs = append(connectedTabs, t.ID)
+				break
+			}
+		}
+	}
+
+	teamTab.TeamsState.ConnectedTabs = connectedTabs
+	fmt.Printf("[App.ApplyTeamPreset] Applied preset '%s', matched workers: %v\n", preset.Name, connectedTabs)
+
+	// Notify frontend of tab state change
+	runtime.EventsEmit(a.ctx, "tabs-updated")
+	go a.saveState()
+	return nil
+}
+
+// DeleteTeamPreset removes a saved team preset
+func (a *App) DeleteTeamPreset(presetID string) error {
+	a.tabsMu.Lock()
+	defer a.tabsMu.Unlock()
+
+	for i, p := range a.settings.TeamPresets {
+		if p.ID == presetID {
+			a.settings.TeamPresets = append(a.settings.TeamPresets[:i], a.settings.TeamPresets[i+1:]...)
+			fmt.Printf("[App.DeleteTeamPreset] Deleted preset '%s'\n", p.Name)
+			go a.saveState()
+			return nil
+		}
+	}
+
+	return fmt.Errorf("preset not found: %s", presetID)
+}
+
+// RenameTeamPreset renames an existing team preset
+func (a *App) RenameTeamPreset(presetID, newName string) error {
+	a.tabsMu.Lock()
+	defer a.tabsMu.Unlock()
+
+	for i, p := range a.settings.TeamPresets {
+		if p.ID == presetID {
+			a.settings.TeamPresets[i].Name = newName
+			fmt.Printf("[App.RenameTeamPreset] Renamed preset '%s' to '%s'\n", p.Name, newName)
+			go a.saveState()
+			return nil
+		}
+	}
+
+	return fmt.Errorf("preset not found: %s", presetID)
 }
 
 // SendTeamsMessage handles Teams (Beta) orchestration: single CLI call with --agents flag.
@@ -1699,11 +1856,14 @@ func (a *App) SendTeamsMessage(teamTabID, message string, files []string) error 
 	a.tabsMu.RUnlock()
 
 	systemPrompt := fmt.Sprintf(
-		"You are a team orchestrator. You have access to the following worker agents:\n%s\n\n"+
-			"Use the Task tool to delegate work to these agents. "+
-			"Each agent has access to Read, Write, Edit, Bash, Glob, Grep tools. "+
-			"Delegate tasks in parallel when possible. "+
-			"After all tasks are complete, synthesize the results into a comprehensive response.",
+		"You are a team orchestrator managing multiple worker agents.\n"+
+			"Available agents:\n%s\n\n"+
+			"CRITICAL INSTRUCTIONS:\n"+
+			"- You MUST delegate ALL work to the appropriate agents using the Agent tool.\n"+
+			"- NEVER perform file reads, writes, or analysis yourself.\n"+
+			"- Delegate tasks to agents in parallel when possible.\n"+
+			"- After all agents complete, synthesize their results into a comprehensive response.\n"+
+			"- Each agent has access to: Read, Write, Edit, Bash, Glob, Grep tools.",
 		strings.Join(tabInfo, "\n"))
 
 	// Send streaming start
@@ -1712,6 +1872,8 @@ func (a *App) SendTeamsMessage(teamTabID, message string, files []string) error 
 
 	sendStartTime := time.Now()
 	var streamingContent string
+	var activeWorkerTabID string
+	workerContent := make(map[string]string)
 
 	// Single CLI call with --agents — Claude autonomously delegates
 	response, _, _, err := a.claude.SendMessage(ctx, teamTabID, message, files, teamTab.WorkDir, 0, systemPrompt, "bypassPermissions", "", agentsJSON,
@@ -1720,21 +1882,53 @@ func (a *App) SendTeamsMessage(teamTabID, message string, files []string) error 
 			a.wsServer.SendStreamChunk(teamTabID, chunk)
 		},
 		func(toolName, detail string) {
-			// Always send tool activity to team tab
+			fmt.Printf("[Teams] Tool activity: name=%s, detail=%s\n", toolName, detail)
 			a.wsServer.SendToolActivity(teamTabID, toolName, detail)
 
-			// If it's a Task tool use, route to the matching worker tab
-			if toolName == "Task" {
-				workerTabID := matchAgentToTab(detail, agentMapping)
-				if workerTabID != "" {
+			// 워커 매칭: toolName이 직접 에이전트 이름인 경우 (--agents 모드)
+			workerTabID := matchToolToAgent(toolName, agentMapping)
+			// 폴백: Agent/Task tool_use에서 detail로 매칭
+			if workerTabID == "" && (toolName == "Agent" || toolName == "Task") {
+				workerTabID = matchAgentToTab(detail, agentMapping)
+			}
+
+			if workerTabID != "" {
+				// 이전 활성 워커 스트리밍 종료
+				if activeWorkerTabID != "" && activeWorkerTabID != workerTabID {
+					a.wsServer.SendStreamEnd(activeWorkerTabID)
+				}
+				// 워커 전환 시에만 이벤트 발행
+				if activeWorkerTabID != workerTabID {
+					// 이전 워커 완료 처리
+					if activeWorkerTabID != "" {
+						a.wsServer.SendOrchestratorEvent(websocket.OrchestratorMessage{
+							Type:        "task-completed",
+							AdminTabID:  teamTabID,
+							TaskID:      fmt.Sprintf("teams-%s", activeWorkerTabID),
+							WorkerTabID: activeWorkerTabID,
+							Content:     "",
+						})
+					}
+					activeWorkerTabID = workerTabID
+					workerContent[workerTabID] = "## Task\n" + detail
+					a.wsServer.SendStreamStart(workerTabID)
+					a.wsServer.SendStreamChunk(workerTabID, workerContent[workerTabID])
+					// 새 워커 시작 (워커별 고정 ID)
 					a.wsServer.SendOrchestratorEvent(websocket.OrchestratorMessage{
 						Type:        "task-started",
 						AdminTabID:  teamTabID,
-						TaskID:      fmt.Sprintf("teams-%d", time.Now().UnixNano()),
+						TaskID:      fmt.Sprintf("teams-%s", workerTabID),
 						WorkerTabID: workerTabID,
 						Content:     detail,
 					})
 				}
+			} else if activeWorkerTabID != "" {
+				// 활성 워커에 도구 활동 중계 + 스트림 청크 전송
+				workerContent[activeWorkerTabID] += "\n\n**" + toolName + "**: " + detail
+				a.wsServer.SendStreamChunk(activeWorkerTabID, workerContent[activeWorkerTabID])
+				a.wsServer.SendToolActivity(activeWorkerTabID, toolName, detail)
+				// 어드민 탭에도 워커의 도구 활동 전달
+				a.wsServer.SendToolActivity(teamTabID, toolName, detail)
 			}
 		},
 		func(input, output int) {
@@ -1744,11 +1938,23 @@ func (a *App) SendTeamsMessage(teamTabID, message string, files []string) error 
 
 	if err != nil {
 		if ctx.Err() == context.Canceled {
+			for _, wID := range connectedTabs {
+				a.wsServer.SendStreamEnd(wID)
+			}
 			a.wsServer.SendStreamEnd(teamTabID)
 			runtime.EventsEmit(a.ctx, "streaming-end", teamTabID)
 			return nil
 		}
+		for _, wID := range connectedTabs {
+			a.wsServer.SendStreamEnd(wID)
+		}
 		a.wsServer.SendStreamError(teamTabID, err.Error())
+		// Send job-completed with failed status so frontend can mark running tasks as failed
+		a.wsServer.SendOrchestratorEvent(websocket.OrchestratorMessage{
+			Type:       "job-completed",
+			AdminTabID: teamTabID,
+			Status:     "failed",
+		})
 		runtime.EventsEmit(a.ctx, "streaming-end", teamTabID)
 		return fmt.Errorf("teams message failed: %w", err)
 	}
@@ -1759,6 +1965,9 @@ func (a *App) SendTeamsMessage(teamTabID, message string, files []string) error 
 	}
 	time.Sleep(50 * time.Millisecond)
 
+	if activeWorkerTabID != "" {
+		a.wsServer.SendStreamEnd(activeWorkerTabID)
+	}
 	a.wsServer.SendStreamEnd(teamTabID)
 	runtime.EventsEmit(a.ctx, "streaming-end", teamTabID)
 
@@ -1772,6 +1981,18 @@ func (a *App) SendTeamsMessage(teamTabID, message string, files []string) error 
 	}
 	a.tabsMu.Lock()
 	teamTab.Messages = append(teamTab.Messages, responseMsg)
+	for wID, content := range workerContent {
+		if wTab, ok := a.tabs[wID]; ok && content != "" {
+			wTab.Messages = append(wTab.Messages, models.Message{
+				Role:    "assistant",
+				Content: content,
+				Metadata: map[string]string{
+					"type":       "teams-worker",
+					"teamsTabId": teamTabID,
+				},
+			})
+		}
+	}
 	a.tabsMu.Unlock()
 
 	// Send job-completed event
@@ -1787,6 +2008,17 @@ func (a *App) SendTeamsMessage(teamTabID, message string, files []string) error 
 	go a.saveState()
 
 	return nil
+}
+
+// matchToolToAgent checks if toolName directly matches an agent name in the mapping.
+func matchToolToAgent(toolName string, agentMapping map[string]string) string {
+	toolNameLower := strings.ToLower(toolName)
+	for agentName, tabID := range agentMapping {
+		if strings.ToLower(agentName) == toolNameLower {
+			return tabID
+		}
+	}
+	return ""
 }
 
 // matchAgentToTab tries to find the worker tab ID for a given Task tool detail string.
@@ -2044,17 +2276,7 @@ func (a *App) GetPlanContent(tabID string) (string, error) {
 		return string(data), nil
 	}
 
-	// Plan file not found — fall back to last assistant message content
-	fmt.Printf("[GetPlanContent] Plan file not found, falling back to last assistant message\n")
-	a.tabsMu.RLock()
-	messages := tab.Messages
-	a.tabsMu.RUnlock()
-	for i := len(messages) - 1; i >= 0; i-- {
-		if messages[i].Role == "assistant" && messages[i].Content != "" {
-			return messages[i].Content, nil
-		}
-	}
-
+	fmt.Printf("[GetPlanContent] Plan file not found: %s\n", planPath)
 	return "", nil
 }
 
@@ -2087,10 +2309,9 @@ func (a *App) TruncateMessages(tabID string, fromIndex int) error {
 	tab.Messages = tab.Messages[:fromIndex]
 	fmt.Printf("[App.TruncateMessages] Tab %s truncated to %d messages\n", tabID, fromIndex)
 
-	// Reset CLI session since UI state and session history are now out of sync
-	if a.claude.IsInitialized() {
-		a.claude.CreateNewChat(tabID)
-	}
+	// CLI 세션은 유지 — resume 시 전체 컨텍스트 보존
+	// UI 메시지만 잘라내고, CLI 세션은 그대로 두면
+	// 다음 SendMessage에서 --resume으로 기존 세션을 이어감
 
 	runtime.EventsEmit(a.ctx, "tabs-updated")
 	go a.saveState()
@@ -2241,6 +2462,47 @@ func (a *App) CreateClaudeMd(workDir string) (string, error) {
 	return filePath, nil
 }
 
+// CreateTabClaudeMd creates a tab-specific CLAUDE.md that only affects the current tab.
+// The file is stored under .claude/tab-contexts/{tabID}-CLAUDE.md and auto-added to tab.ContextFiles.
+func (a *App) CreateTabClaudeMd(tabID string) (string, error) {
+	tab, exists := a.tabs[tabID]
+	if !exists {
+		return "", fmt.Errorf("tab not found: %s", tabID)
+	}
+
+	// Create directory under workDir/.claude/tab-contexts/
+	dir := filepath.Join(tab.WorkDir, ".claude", "tab-contexts")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", fmt.Errorf("디렉토리 생성 실패: %w", err)
+	}
+
+	filePath := filepath.Join(dir, fmt.Sprintf("%s-CLAUDE.md", tabID))
+
+	// Check if already exists
+	if _, err := os.Stat(filePath); err == nil {
+		// Already exists, just make sure it's in ContextFiles
+		for _, cf := range tab.ContextFiles {
+			if cf == filePath {
+				return filePath, nil
+			}
+		}
+		tab.ContextFiles = append(tab.ContextFiles, filePath)
+		go a.saveState()
+		return filePath, nil
+	}
+
+	content := "# CLAUDE.md (탭 전용)\n\n이 파일은 현재 탭에서만 적용됩니다.\n프로젝트 컨텍스트를 여기에 작성하세요.\n"
+	if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
+		return "", fmt.Errorf("파일 생성 실패: %w", err)
+	}
+
+	// Auto-add to tab's context files
+	tab.ContextFiles = append(tab.ContextFiles, filePath)
+	go a.saveState()
+
+	return filePath, nil
+}
+
 // AutoContextFile represents a file automatically referenced by Claude CLI
 type AutoContextFile struct {
 	Path   string `json:"path"`
@@ -2363,15 +2625,6 @@ func (a *App) SetWorkDir(tabID, dir string) error {
 			TabID:   tabID,
 			WorkDir: absDir,
 		})
-		// Suggest CLAUDE.md if it doesn't exist in the project
-		claudeMdPath := filepath.Join(absDir, "CLAUDE.md")
-		if _, err := os.Stat(claudeMdPath); os.IsNotExist(err) {
-			a.agentService.Enqueue(claude.AgentTask{
-				Type:    claude.AgentTaskClaudeMd,
-				TabID:   tabID,
-				WorkDir: absDir,
-			})
-		}
 	}
 
 	go a.saveState()
@@ -2838,16 +3091,6 @@ func (a *App) handleAgentResult(result claude.AgentResult) {
 			"language":  result.Data["language"],
 			"framework": result.Data["framework"],
 		})
-	case claude.AgentTaskClaudeMd:
-		runtime.EventsEmit(a.ctx, "agent-claudemd-suggestion", map[string]interface{}{
-			"workDir": result.WorkDir,
-			"content": result.Data["content"],
-		})
-	case claude.AgentTaskContextFiles:
-		runtime.EventsEmit(a.ctx, "agent-context-recommendation", map[string]interface{}{
-			"tabID": result.TabID,
-			"files": result.Data["files"],
-		})
 	case claude.AgentTaskCodeReview:
 		runtime.EventsEmit(a.ctx, "agent-code-review", map[string]interface{}{
 			"tabID":   result.TabID,
@@ -2870,19 +3113,6 @@ func (a *App) SetAgentModel(model string) error {
 	}
 	go a.saveState()
 	return nil
-}
-
-// RequestContextRecommendation triggers a context file recommendation for the given tab
-func (a *App) RequestContextRecommendation(tabID string) {
-	tab, exists := a.tabs[tabID]
-	if !exists || a.agentService == nil {
-		return
-	}
-	a.agentService.Enqueue(claude.AgentTask{
-		Type:    claude.AgentTaskContextFiles,
-		TabID:   tabID,
-		WorkDir: tab.WorkDir,
-	})
 }
 
 // RequestCodeReview triggers a code review agent for the given tab's git diff
@@ -3002,6 +3232,26 @@ func (a *App) SaveDroppedFile(fileName string, base64Data string) (string, error
 
 	fmt.Printf("[App.SaveDroppedFile] Saved dropped file: %s\n", tmpPath)
 	return tmpPath, nil
+}
+
+// ResumeSessionInTerminal opens a new Terminal.app window with claude --resume
+func (a *App) ResumeSessionInTerminal(sessionID, projectPath string) error {
+	if sessionID == "" {
+		return fmt.Errorf("session ID is empty")
+	}
+	dir := projectPath
+	if dir == "" {
+		dir, _ = os.UserHomeDir()
+	}
+	// Shell-escape paths and session ID by wrapping in single quotes
+	escDir := "'" + strings.ReplaceAll(dir, "'", "'\\''") + "'"
+	escSession := "'" + strings.ReplaceAll(sessionID, "'", "'\\''") + "'"
+	script := fmt.Sprintf(`tell application "Terminal"
+	activate
+	do script "cd %s && claude --resume %s"
+end tell`, escDir, escSession)
+	cmd := exec.Command("osascript", "-e", script)
+	return cmd.Run()
 }
 
 // ReadFileSnippet reads lines from a file for snippet preview

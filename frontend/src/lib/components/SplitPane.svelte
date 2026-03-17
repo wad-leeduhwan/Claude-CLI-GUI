@@ -1,11 +1,12 @@
 <script>
   import { createEventDispatcher, tick } from 'svelte';
   import ConversationTab from './ConversationTab.svelte';
-  import { GetTabs, RemoveTab, ToggleTabAdminMode, SetWorkDir, CompletePath, AddContextFile, RemoveContextFile, GetContextFileContent, SaveFileContent, GetAutoContextFiles, SelectFiles, ConnectWorkerTab, DisconnectWorkerTab, ConnectTeamsWorker, DisconnectTeamsWorker, GetAvailableModels, GetCurrentModel, SetModel, GetAvailableSessions, SwitchTabSession, GetTabSessionID, DeleteSession, CreateClaudeMd, RenameFile, DeleteFile, RenameTab, RequestContextRecommendation, RequestCodeReview, GetPlanContent } from '../../../wailsjs/go/main/App';
+  import { GetTabs, RemoveTab, ToggleTabAdminMode, SetWorkDir, CompletePath, AddContextFile, RemoveContextFile, GetContextFileContent, SaveFileContent, GetAutoContextFiles, SelectFiles, ConnectWorkerTab, DisconnectWorkerTab, ConnectTeamsWorker, DisconnectTeamsWorker, GetAvailableModels, GetCurrentModel, SetModel, GetAvailableSessions, SwitchTabSession, GetTabSessionID, DeleteSession, CreateClaudeMd, CreateTabClaudeMd, RenameFile, DeleteFile, RenameTab, RequestCodeReview, GetPlanContent, GetTeamPresets, SaveTeamPreset, ApplyTeamPreset, DeleteTeamPreset, RenameTeamPreset, ResumeSessionInTerminal } from '../../../wailsjs/go/main/App';
   import MarkdownViewer from './MarkdownViewer.svelte';
   import { orchestratorStore } from '../stores/orchestrator.js';
   import { modelStore } from '../stores/model.js';
   import { agentStore } from '../stores/agent.js';
+  import { streamingStore } from '../stores/streaming.js';
 
   export let node;
   export let tabs = [];
@@ -24,6 +25,7 @@
   // Editor panel state
   let editorFile = null;       // { path, content, originalContent }
   let editorDirty = false;
+  let editorCloseConfirm = false;
   let editorSaving = false;
   let editorSplitRatio = [1, 1]; // [conversation flex, editor flex]
   let editorResizing = null;
@@ -33,6 +35,14 @@
   let editorRenaming = false;
   let editorRenameInput = '';
   let editorRenameInputEl = null;
+
+  function isTeamsWorkerBusy(tabId) {
+    return tabs.some(t =>
+      t.teamsMode &&
+      t.teamsState?.connectedTabs?.includes(tabId) &&
+      $streamingStore[t.id]?.isStreaming
+    );
+  }
 
   function toggleContext() {
     contextExpanded = !contextExpanded;
@@ -77,9 +87,6 @@
   }
 
   async function deleteFileFromDisk(path) {
-    const fileName = path.split('/').pop() || path;
-    const confirmed = confirm(`"${fileName}" 파일을 디스크에서 삭제하시겠습니까?\n\n${path}\n\n이 작업은 되돌릴 수 없습니다.`);
-    if (!confirmed) return;
     try {
       await DeleteFile(path);
       // Close editor if the deleted file was open
@@ -132,47 +139,57 @@
     agentStore.clearTabRename(tab.id);
   }
 
-  // Agent: create CLAUDE.md with AI-suggested content
-  async function createClaudeMdWithSuggestion() {
+  // Inline tab name editing
+  let editingTabName = false;
+  let tabNameInput = '';
+  let tabNameInputEl;
+
+  function startEditTabName() {
     if (!tab) return;
-    const content = $agentStore.claudeMdSuggestions[tab.workDir];
-    if (!content) return;
-    try {
-      const filePath = tab.workDir + '/CLAUDE.md';
-      await SaveFileContent(filePath, content);
-      agentStore.clearClaudeMdSuggestion(tab.workDir);
-      autoContextFiles = (await GetAutoContextFiles(tab.workDir)) || [];
-      openFileInEditor(filePath);
-    } catch (error) {
-      console.error('Failed to create CLAUDE.md with suggestion:', error);
-    }
+    editingTabName = true;
+    tabNameInput = tab.name;
+    tick().then(() => {
+      if (tabNameInputEl) {
+        tabNameInputEl.focus();
+        tabNameInputEl.select();
+      }
+    });
   }
 
-  // Agent: add recommended file to context
-  async function addRecommendedFile(file) {
-    if (!tab) return;
-    const fullPath = file.startsWith('/') ? file : tab.workDir + '/' + file;
+  async function commitTabName() {
+    editingTabName = false;
+    if (!tab || !tabNameInput.trim() || tabNameInput.trim() === tab.name) return;
     try {
-      await AddContextFile(tab.id, fullPath);
+      await RenameTab(tab.id, tabNameInput.trim());
       dispatch('update');
     } catch (error) {
-      console.error('Failed to add recommended file:', error);
+      console.error('Failed to rename tab:', error);
     }
   }
 
-  function dismissContextRecommendations() {
+  function handleTabNameKeydown(e) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      commitTabName();
+    } else if (e.key === 'Escape') {
+      editingTabName = false;
+    }
+  }
+
+  async function createTabClaudeMd() {
     if (!tab) return;
-    agentStore.clearContextRecommendation(tab.id);
+    try {
+      const filePath = await CreateTabClaudeMd(tab.id);
+      dispatch('update');
+      openFileInEditor(filePath);
+    } catch (error) {
+      console.error('Failed to create tab CLAUDE.md:', error);
+    }
   }
 
   function dismissCodeReview() {
     if (!tab) return;
     agentStore.clearCodeReview(tab.id);
-  }
-
-  function requestContextFiles() {
-    if (!tab) return;
-    RequestContextRecommendation(tab.id);
   }
 
   function getContextBasePath(path, name) {
@@ -214,13 +231,18 @@
   }
 
   function closeEditor() {
-    if (editorDirty) {
-      const confirmed = confirm('저장하지 않은 변경사항이 있습니다. 닫으시겠습니까?');
-      if (!confirmed) return;
+    if (editorDirty && !editorCloseConfirm) {
+      editorCloseConfirm = true;
+      return;
     }
+    editorCloseConfirm = false;
     editorFile = null;
     editorDirty = false;
     editorSplitRatio = [1, 1];
+  }
+
+  function cancelCloseEditor() {
+    editorCloseConfirm = false;
   }
 
   async function saveEditorFile() {
@@ -384,6 +406,14 @@
     }
   }
 
+  // Teams: get parent team tab name for a worker tab
+  function getTeamsParentName(tabId) {
+    const parent = tabs.find(t =>
+      t.teamsMode && t.teamsState?.connectedTabs?.includes(tabId)
+    );
+    return parent ? parent.name : null;
+  }
+
   // Teams worker connection helpers
   function isTeamsConnected(workerTabId) {
     if (!tab || !tab.teamsState) return false;
@@ -404,6 +434,118 @@
     }
   }
 
+  // Teams preset management
+  let teamPresets = [];
+  let selectedPresetId = '';
+  let presetNameInput = '';
+  let showPresetNameInput = false;
+  let presetNameInputEl;
+  let editingPresetId = '';
+  let editingPresetName = '';
+  let editingPresetInputEl;
+  let presetDropdownOpen = false;
+
+  async function loadPresets() {
+    try {
+      teamPresets = await GetTeamPresets();
+    } catch (error) {
+      console.error('Failed to load team presets:', error);
+    }
+  }
+
+  function startSavePreset() {
+    if (!tab || !tab.teamsMode || !tab.teamsState) return;
+    if ((tab.teamsState.connectedTabs || []).length === 0) return;
+    showPresetNameInput = true;
+    presetNameInput = '';
+    tick().then(() => {
+      if (presetNameInputEl) presetNameInputEl.focus();
+    });
+  }
+
+  async function commitSavePreset() {
+    showPresetNameInput = false;
+    if (!tab || !presetNameInput.trim()) return;
+    try {
+      await SaveTeamPreset(tab.id, presetNameInput.trim());
+      await loadPresets();
+    } catch (error) {
+      console.error('Failed to save team preset:', error);
+    }
+  }
+
+  function handlePresetNameKeydown(e) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      commitSavePreset();
+    } else if (e.key === 'Escape') {
+      showPresetNameInput = false;
+    }
+  }
+
+  async function onPresetSelected(presetId) {
+    if (!presetId || !tab || !tab.teamsMode) return;
+    try {
+      selectedPresetId = presetId;
+      await ApplyTeamPreset(tab.id, presetId);
+      dispatch('update');
+    } catch (error) {
+      console.error('Failed to apply team preset:', error);
+    }
+  }
+
+  async function deletePreset(presetId) {
+    if (!presetId) return;
+    try {
+      await DeleteTeamPreset(presetId);
+      if (selectedPresetId === presetId) {
+        selectedPresetId = '';
+      }
+      await loadPresets();
+    } catch (error) {
+      console.error('Failed to delete team preset:', error);
+    }
+  }
+
+  function startRenamePreset(presetId) {
+    const id = presetId || selectedPresetId;
+    if (!id) return;
+    const preset = teamPresets.find(p => p.id === id);
+    if (!preset) return;
+    editingPresetId = id;
+    editingPresetName = preset.name;
+    tick().then(() => {
+      if (editingPresetInputEl) {
+        editingPresetInputEl.focus();
+        editingPresetInputEl.select();
+      }
+    });
+  }
+
+  async function commitRenamePreset() {
+    const id = editingPresetId;
+    const name = editingPresetName.trim();
+    editingPresetId = '';
+    editingPresetName = '';
+    if (!id || !name) return;
+    try {
+      await RenameTeamPreset(id, name);
+      await loadPresets();
+    } catch (error) {
+      console.error('Failed to rename team preset:', error);
+    }
+  }
+
+  function handleRenamePresetKeydown(e) {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      commitRenamePreset();
+    } else if (e.key === 'Escape') {
+      editingPresetId = '';
+      editingPresetName = '';
+    }
+  }
+
   // Check if a tab is actively working as a worker
   function isWorkerActive(tabId) {
     const state = $orchestratorStore;
@@ -420,6 +562,11 @@
   }
 
   $: workerActive = tab ? isWorkerActive(tab.id) : false;
+
+  // Load presets when teams mode is active
+  $: if (tab && tab.teamsMode) {
+    loadPresets();
+  }
 
   // WorkDir editing state
   let editingWorkDir = false;
@@ -808,6 +955,11 @@
     loadSessionsCache();
   }
 
+  // Rebuild session-tab map when tabs prop changes (e.g. tab rename)
+  $: if (tabs && tabs.length > 0 && threadCachedSessions.length > 0) {
+    buildSessionTabMap();
+  }
+
   // Also refresh currentSessionId when tab changes
   $: if (tab && tab.id) {
     GetTabSessionID(tab.id).then(id => {
@@ -817,6 +969,7 @@
 
   let threadDeleteConfirm = null; // { sessionId, projectPath, preview }
   let threadCollapsedGroups = {}; // { [projectPath]: true/false }
+  let threadSearchQuery = '';
 
   function toggleGroupCollapse(projectPath) {
     threadCollapsedGroups[projectPath] = !threadCollapsedGroups[projectPath];
@@ -840,6 +993,7 @@
     }
     threadPopupSelectedIndex = 0;
     threadDeleteConfirm = null;
+    threadSearchQuery = '';
     threadPopupOpen = true;
     setTimeout(() => {
       function onClickOutside(e) {
@@ -867,6 +1021,15 @@
     } catch (e) {
       console.error('Failed to switch session:', e);
       alert(e);
+    }
+  }
+
+  async function resumeSessionInTerminal(sessionId, projectPath) {
+    try {
+      await ResumeSessionInTerminal(sessionId, projectPath);
+    } catch (e) {
+      console.error('Failed to open terminal:', e);
+      alert('터미널 열기 실패: ' + e);
     }
   }
 
@@ -909,8 +1072,25 @@
       return tb.localeCompare(ta);
     });
   })();
+  // Search filter for sessions
+  function matchSession(session, tabMap) {
+    const q = threadSearchQuery.toLowerCase();
+    if ((session.preview || '').toLowerCase().includes(q)) return true;
+    const tabName = tabMap[session.sessionId];
+    if (tabName && tabName.toLowerCase().includes(q)) return true;
+    return false;
+  }
+
+  $: threadFilteredCurrentProject = threadSearchQuery
+    ? threadCurrentProject.filter(s => matchSession(s, threadSessionTabMap))
+    : threadCurrentProject;
+
+  $: threadFilteredOtherByProject = threadSearchQuery
+    ? threadOtherByProject.map(([path, sessions]) => [path, sessions.filter(s => matchSession(s, threadSessionTabMap))]).filter(([, sessions]) => sessions.length > 0)
+    : threadOtherByProject;
+
   // Flat list for keyboard nav: [new] + currentProject + all others flattened
-  $: threadFlatList = [...threadCurrentProject, ...threadOtherByProject.flatMap(([, sessions]) => sessions)];
+  $: threadFlatList = [...threadFilteredCurrentProject, ...threadFilteredOtherByProject.flatMap(([, sessions]) => sessions)];
 
   function handleThreadPopupKeydown(event) {
     if (!threadPopupOpen) return;
@@ -919,6 +1099,7 @@
     if (event.key === 'ArrowUp') { event.preventDefault(); threadPopupSelectedIndex = (threadPopupSelectedIndex - 1 + totalItems) % totalItems; }
     if (event.key === 'Enter') {
       event.preventDefault();
+      if (threadSearchQuery && threadFlatList.length === 0) return;
       if (threadPopupSelectedIndex === 0) {
         selectSession('', '');
       } else {
@@ -974,7 +1155,7 @@
 
 </script>
 
-<svelte:window on:mousemove={(e) => { handleResizeMove(e); handleEditorResizeMove(e); }} on:mouseup={() => { stopResize(); stopEditorResize(); }} on:keydown={handlePopupKeydown} />
+<svelte:window on:mousemove={(e) => { handleResizeMove(e); handleEditorResizeMove(e); }} on:mouseup={() => { stopResize(); stopEditorResize(); }} on:keydown={handlePopupKeydown} on:click={(e) => { if (presetDropdownOpen && !e.target.closest('.preset-dropdown-wrapper')) presetDropdownOpen = false; }} />
 
 {#if node.type === 'container'}
   <div class="split-container" class:horizontal={node.direction === 'horizontal'} class:vertical={node.direction === 'vertical'}>
@@ -1004,7 +1185,18 @@
       on:dragstart={(e) => handleDragStart(e, tab.id)}
     >
       <div class="panel-header-row0">
-        <span class="panel-title">{tab.name}</span>
+        {#if editingTabName}
+          <input
+            bind:this={tabNameInputEl}
+            bind:value={tabNameInput}
+            on:keydown={handleTabNameKeydown}
+            on:blur={commitTabName}
+            class="panel-title-input"
+            spellcheck="false"
+          />
+        {:else}
+          <span class="panel-title" on:dblclick|stopPropagation={startEditTabName}>{tab.name}</span>
+        {/if}
         {#if $agentStore.tabRenames[tab.id]}
           <span class="agent-rename-suggestion" on:click|stopPropagation={acceptRename} title="클릭하여 적용">
             &rarr; {$agentStore.tabRenames[tab.id]}
@@ -1021,6 +1213,9 @@
         </button>
       </div>
       <div class="panel-header-row1">
+        {#if getTeamsParentName(tab.id)}
+          <span class="teams-worker-badge">🔗 {getTeamsParentName(tab.id)}</span>
+        {/if}
         {#if $modelStore}
           <span class="header-label" title="Claude API 호출에 사용할 AI 모델">모델</span>
           <div class="model-badge-wrapper" draggable="false" on:mousedown|stopPropagation on:dragstart|preventDefault|stopPropagation>
@@ -1063,6 +1258,13 @@
                 <button class="thread-refresh-btn" class:spinning={threadLoading} on:click|stopPropagation={refreshSessions} title="새로고침">↻</button>
               </div>
               <div class="thread-popup-divider"></div>
+              <input
+                class="thread-search-input"
+                type="text"
+                placeholder="세션 검색..."
+                bind:value={threadSearchQuery}
+                on:keydown|stopPropagation={handleThreadPopupKeydown}
+              />
               <div
                 class="thread-popup-item new-session"
                 class:selected={threadPopupSelectedIndex === 0}
@@ -1072,14 +1274,14 @@
                 <span class="thread-new-label">새 세션</span>
                 {#if !threadPopupCurrentSessionId}<span class="thread-popup-current">현재</span>{/if}
               </div>
-              {#if threadCurrentProject.length > 0}
+              {#if threadFilteredCurrentProject.length > 0}
                 <div class="thread-popup-divider"></div>
                 <div class="thread-popup-group-header" on:click|stopPropagation={() => toggleGroupCollapse(tab.workDir)}>
                   <span class="thread-group-arrow" class:collapsed={threadCollapsedGroups[tab.workDir]}></span>
                   <span class="thread-popup-group-label">{shortenPath(tab.workDir)}</span>
-                  <span class="thread-group-count">{threadCurrentProject.length}</span>
+                  <span class="thread-group-count">{threadFilteredCurrentProject.length}</span>
                 </div>
-                {#each threadCurrentProject as session, i}
+                {#each threadFilteredCurrentProject as session, i}
                   {#if isSessionVisible(session, tab.workDir, threadCollapsedGroups[tab.workDir])}
                     <div
                       class="thread-popup-item"
@@ -1088,6 +1290,7 @@
                     >
                       <div class="thread-item-row">
                         <div class="thread-item-preview">{session.preview || '(비어있음)'}</div>
+                        <button class="thread-item-cli" on:click|stopPropagation={() => resumeSessionInTerminal(session.sessionId, session.projectPath)} title="터미널에서 이어서">▶</button>
                         <button class="thread-item-delete" on:click|stopPropagation={() => confirmDeleteSession(session.sessionId, session.projectPath, session.preview)} title="삭제">✕</button>
                       </div>
                       <div class="thread-item-meta">
@@ -1100,7 +1303,7 @@
                   {/if}
                 {/each}
               {/if}
-              {#each threadOtherByProject as [projectPath, sessions]}
+              {#each threadFilteredOtherByProject as [projectPath, sessions]}
                 <div class="thread-popup-divider"></div>
                 <div class="thread-popup-group-header" on:click|stopPropagation={() => toggleGroupCollapse(projectPath)}>
                   <span class="thread-group-arrow" class:collapsed={threadCollapsedGroups[projectPath]}></span>
@@ -1117,6 +1320,7 @@
                     >
                       <div class="thread-item-row">
                         <div class="thread-item-preview">{session.preview || '(비어있음)'}</div>
+                        <button class="thread-item-cli" on:click|stopPropagation={() => resumeSessionInTerminal(session.sessionId, session.projectPath)} title="터미널에서 이어서">▶</button>
                         <button class="thread-item-delete" on:click|stopPropagation={() => confirmDeleteSession(session.sessionId, session.projectPath, session.preview)} title="삭제">✕</button>
                       </div>
                       <div class="thread-item-meta">
@@ -1215,6 +1419,56 @@
     {#if tab.teamsMode && tab.teamsState}
       <div class="worker-connections teams">
         <span class="worker-connections-label"><span class="teams-badge">Teams</span> 에이전트:</span>
+
+        <!-- Preset controls -->
+        <div class="teams-preset-controls">
+          {#if showPresetNameInput}
+            <input
+              bind:this={presetNameInputEl}
+              bind:value={presetNameInput}
+              on:keydown={handlePresetNameKeydown}
+              on:blur={commitSavePreset}
+              class="preset-name-input"
+              spellcheck="false"
+              placeholder="프리셋 이름 입력 후 Enter"
+            />
+          {/if}
+          <div class="preset-dropdown-wrapper">
+            <button class="preset-dropdown-toggle" on:click|stopPropagation={() => presetDropdownOpen = !presetDropdownOpen}>
+              {selectedPresetId ? (teamPresets.find(p => p.id === selectedPresetId)?.name || '프리셋 선택') : '프리셋 선택'}
+              <span class="preset-dropdown-arrow">{presetDropdownOpen ? '▲' : '▼'}</span>
+            </button>
+            {#if presetDropdownOpen}
+              <div class="preset-dropdown-panel" on:click|stopPropagation>
+                {#each teamPresets as preset}
+                  <div class="preset-dropdown-item" class:selected={selectedPresetId === preset.id}>
+                    {#if editingPresetId === preset.id}
+                      <input
+                        bind:this={editingPresetInputEl}
+                        bind:value={editingPresetName}
+                        on:keydown={handleRenamePresetKeydown}
+                        on:blur={commitRenamePreset}
+                        class="preset-dropdown-input"
+                        spellcheck="false"
+                      />
+                    {:else}
+                      <span class="preset-dropdown-name" on:click={() => { onPresetSelected(preset.id); presetDropdownOpen = false; }} on:dblclick|stopPropagation={() => startRenamePreset(preset.id)} title="클릭: 적용 / 더블클릭: 이름 변경">
+                        {preset.name}
+                      </span>
+                      <button class="preset-dropdown-delete" on:click|stopPropagation={() => deletePreset(preset.id)} title="삭제">&times;</button>
+                    {/if}
+                  </div>
+                {/each}
+                {#if teamPresets.length === 0}
+                  <div class="preset-dropdown-empty">저장된 프리셋 없음</div>
+                {/if}
+              </div>
+            {/if}
+          </div>
+          <button class="preset-btn" on:click|stopPropagation={startSavePreset} title="현재 구성 저장">💾</button>
+        </div>
+
+        <!-- Worker chips: toggleable for manual connect/disconnect -->
         {#each tabs.filter(t => !t.teamsMode && t.id !== tab.id) as wTab}
           <button
             class="worker-chip teams"
@@ -1264,33 +1518,11 @@
             {/each}
           </div>
           {#if !autoContextFiles.some(f => f.name === 'CLAUDE.md' && f.scope === 'project')}
-            {#if $agentStore.claudeMdSuggestions[tab.workDir]}
-              <button class="context-add-btn claude-md-btn ai-suggested" on:click={createClaudeMdWithSuggestion}>+ CLAUDE.md 생성 (AI 초안)</button>
-            {:else}
               <button class="context-add-btn claude-md-btn" on:click={createClaudeMd}>+ CLAUDE.md 생성</button>
-            {/if}
           {/if}
+          <button class="context-add-btn claude-md-btn" on:click={createTabClaudeMd}>+ 탭 전용 CLAUDE.md</button>
           <button class="context-add-btn" on:click={addContextFile}>+ 파일 추가</button>
-          <button class="context-add-btn" on:click={requestContextFiles}>AI 추천</button>
         </div>
-
-        {#if $agentStore.contextRecommendations[tab.id]?.length > 0}
-          <div class="context-section">
-            <div class="context-section-label">
-              추천 컨텍스트 파일
-              <button class="agent-dismiss-btn small" on:click={dismissContextRecommendations} title="닫기">✕</button>
-            </div>
-            <div class="context-files">
-              {#each $agentStore.contextRecommendations[tab.id] as file}
-                <div class="context-file-item recommended">
-                  <span class="context-file-name" on:click={() => addRecommendedFile(file)} title="클릭하여 컨텍스트에 추가">
-                    {file}
-                  </span>
-                </div>
-              {/each}
-            </div>
-          </div>
-        {/if}
 
       </div>
     {/if}
@@ -1349,6 +1581,8 @@
             teamsMode={tab.teamsMode}
             planMode={tab.planMode}
             workDir={tab.workDir}
+            isTeamsWorkerBusy={isTeamsWorkerBusy(tab.id)}
+            workerTabNames={Object.fromEntries(tabs.map(t => [t.id, t.name]))}
             on:refresh={() => {
               console.log('[SplitPane] Received refresh event, dispatching update');
               dispatch('update');
@@ -1380,7 +1614,15 @@
               <button class="editor-save-btn" on:click={saveEditorFile} disabled={!editorDirty || editorSaving}>
                 {editorSaving ? '저장 중...' : '저장'}
               </button>
-              <button class="editor-close-btn" on:click={closeEditor}>✕</button>
+              {#if editorCloseConfirm}
+                <span class="editor-close-confirm">
+                  <span>저장 안 함?</span>
+                  <button class="editor-confirm-yes" on:click={closeEditor}>닫기</button>
+                  <button class="editor-confirm-no" on:click={cancelCloseEditor}>취소</button>
+                </span>
+              {:else}
+                <button class="editor-close-btn" on:click={closeEditor}>✕</button>
+              {/if}
             </div>
           </div>
           <div class="editor-body">
@@ -1561,6 +1803,21 @@
     font-weight: 500;
     user-select: none;
     flex-shrink: 0;
+    cursor: default;
+  }
+
+  .panel-title-input {
+    font-weight: 500;
+    font-size: inherit;
+    font-family: inherit;
+    background: var(--bg-secondary, #1e1e2e);
+    color: var(--text-primary, #cdd6f4);
+    border: 1px solid var(--accent, #89b4fa);
+    border-radius: 3px;
+    padding: 0 4px;
+    outline: none;
+    flex-shrink: 0;
+    width: 120px;
   }
 
   .model-badge-wrapper {
@@ -1778,6 +2035,21 @@
     margin: 0;
   }
 
+  .thread-search-input {
+    width: 100%;
+    padding: 4px 8px;
+    border: 1px solid var(--border-primary, #333);
+    border-radius: 4px;
+    background: var(--bg-secondary, #1e1e1e);
+    color: var(--text-primary, #e0e0e0);
+    font-size: 12px;
+    outline: none;
+    box-sizing: border-box;
+  }
+  .thread-search-input:focus {
+    border-color: var(--accent, #6366f1);
+  }
+
   .thread-item-row {
     display: flex;
     align-items: center;
@@ -1793,6 +2065,29 @@
     flex: 1;
     min-width: 0;
     line-height: 1.4;
+  }
+
+  .thread-item-cli {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 10px;
+    cursor: pointer;
+    padding: 0 3px;
+    border-radius: 2px;
+    opacity: 0;
+    flex-shrink: 0;
+    transition: opacity 0.15s, color 0.15s;
+    line-height: 1;
+  }
+
+  .thread-popup-item:hover .thread-item-cli {
+    opacity: 0.6;
+  }
+
+  .thread-item-cli:hover {
+    opacity: 1 !important;
+    color: #10b981;
   }
 
   .thread-item-delete {
@@ -2157,15 +2452,8 @@
     opacity: 0.85;
   }
 
-  .context-file-item.auto {
-    position: relative;
-  }
-
   .context-file-path {
-    position: absolute;
-    right: 6px;
-    top: 50%;
-    transform: translateY(-50%);
+    flex-shrink: 1;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -2173,7 +2461,7 @@
     font-size: 10px;
     color: var(--text-secondary);
     opacity: 0.8;
-    max-width: 60%;
+    max-width: 50%;
     direction: rtl;
     text-align: right;
   }
@@ -2284,36 +2572,6 @@
     background-color: var(--accent, #6366f1);
     color: white;
     border-color: var(--accent, #6366f1);
-  }
-
-  .context-add-btn.claude-md-btn.ai-suggested {
-    border-color: #10b981;
-    color: #10b981;
-    animation: gentle-pulse 2s ease-in-out infinite;
-  }
-
-  .context-add-btn.claude-md-btn.ai-suggested:hover {
-    background-color: #10b981;
-    color: white;
-    border-color: #10b981;
-  }
-
-  @keyframes gentle-pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.7; }
-  }
-
-  .context-file-item.recommended {
-    border-left: 2px solid #10b981;
-    padding-left: 6px;
-  }
-
-  .context-file-item.recommended .context-file-name {
-    color: #10b981;
-  }
-
-  .context-file-item.recommended .context-file-name:hover {
-    color: #059669;
   }
 
   /* Agent UI styles */
@@ -2488,6 +2746,42 @@
     color: var(--error, #ef4444);
   }
 
+  .editor-close-confirm {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  .editor-confirm-yes, .editor-confirm-no {
+    background: none;
+    border: 1px solid var(--border-color, #555);
+    border-radius: 4px;
+    padding: 1px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    line-height: 1.4;
+  }
+
+  .editor-confirm-yes {
+    color: var(--error, #ef4444);
+    border-color: var(--error, #ef4444);
+  }
+
+  .editor-confirm-yes:hover {
+    background-color: var(--error, #ef4444);
+    color: white;
+  }
+
+  .editor-confirm-no {
+    color: var(--text-muted);
+  }
+
+  .editor-confirm-no:hover {
+    background-color: var(--bg-hover);
+  }
+
   .editor-body {
     display: flex;
     flex-direction: row;
@@ -2633,6 +2927,180 @@
     color: #0ea5e9;
     letter-spacing: 0.3px;
     text-transform: uppercase;
+  }
+
+  .teams-worker-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 9px;
+    font-weight: 600;
+    background-color: rgba(14, 165, 233, 0.15);
+    color: #0ea5e9;
+    letter-spacing: 0.3px;
+    white-space: nowrap;
+    margin-left: 4px;
+  }
+
+  .teams-preset-controls {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    width: 100%;
+    margin-bottom: 4px;
+  }
+
+  .preset-name-input {
+    flex: 1;
+    padding: 2px 4px;
+    font-size: 11px;
+    border: 1px solid var(--accent, #89b4fa);
+    border-radius: 4px;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    outline: none;
+    min-width: 0;
+  }
+
+  .preset-dropdown-wrapper {
+    position: relative;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .preset-dropdown-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    padding: 3px 8px;
+    font-size: 11px;
+    font-weight: 500;
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    cursor: pointer;
+    transition: border-color 0.15s;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .preset-dropdown-toggle:hover {
+    border-color: #0ea5e9;
+  }
+
+  .preset-dropdown-arrow {
+    font-size: 9px;
+    margin-left: 6px;
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+
+  .preset-dropdown-panel {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    z-index: 100;
+    margin-top: 2px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    max-height: 200px;
+    overflow-y: auto;
+  }
+
+  .preset-dropdown-item {
+    display: flex;
+    align-items: center;
+    padding: 5px 8px;
+    font-size: 11px;
+    cursor: pointer;
+    transition: background-color 0.1s;
+  }
+
+  .preset-dropdown-item:hover {
+    background-color: var(--bg-hover);
+  }
+
+  .preset-dropdown-item.selected {
+    background-color: rgba(14, 165, 233, 0.15);
+    color: #0ea5e9;
+    font-weight: 600;
+  }
+
+  .preset-dropdown-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .preset-dropdown-delete {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    margin-left: 4px;
+    padding: 0;
+    border: none;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0.5;
+    transition: all 0.15s;
+    flex-shrink: 0;
+  }
+
+  .preset-dropdown-delete:hover {
+    opacity: 1;
+    background: rgba(239, 68, 68, 0.2);
+    color: #ef4444;
+  }
+
+  .preset-dropdown-input {
+    flex: 1;
+    padding: 2px 4px;
+    font-size: 11px;
+    border: none;
+    border-bottom: 1px solid var(--accent, #89b4fa);
+    background: transparent;
+    color: var(--text-primary);
+    outline: none;
+    min-width: 0;
+  }
+
+  .preset-dropdown-empty {
+    padding: 8px;
+    font-size: 11px;
+    color: var(--text-muted);
+    text-align: center;
+  }
+
+  .preset-btn {
+    padding: 2px 6px;
+    font-size: 12px;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    background: var(--bg-secondary);
+    cursor: pointer;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+
+  .preset-btn:hover {
+    background: var(--bg-tertiary, rgba(255,255,255,0.1));
+    border-color: #0ea5e9;
   }
 
   .code-review-panel {

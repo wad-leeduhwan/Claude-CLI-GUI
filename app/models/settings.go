@@ -6,6 +6,7 @@ type GlobalSettings struct {
 	AdminMode       bool            `json:"adminMode"`       // Admin mode toggle
 	TabSettings     map[string]bool `json:"tabSettings"`     // Per-tab settings (tab ID -> enabled)
 	AgentModel      string          `json:"agentModel"`      // Model for background agent tasks (default: haiku)
+	TeamPresets     []TeamPreset    `json:"teamPresets"`     // Saved team presets
 }
 
 // FileInfo represents file attachment information

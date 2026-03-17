@@ -11,6 +11,8 @@ export function AddNewTab():Promise<models.TabState>;
 
 export function AnswerQuestion(arg1:string,arg2:Record<string, string>):Promise<void>;
 
+export function ApplyTeamPreset(arg1:string,arg2:string):Promise<void>;
+
 export function CancelMessage(arg1:string):Promise<void>;
 
 export function CancelOrchestrationJob(arg1:string):Promise<void>;
@@ -27,9 +29,13 @@ export function ConnectWorkerTab(arg1:string,arg2:string):Promise<void>;
 
 export function CreateClaudeMd(arg1:string):Promise<string>;
 
+export function CreateTabClaudeMd(arg1:string):Promise<string>;
+
 export function DeleteFile(arg1:string):Promise<void>;
 
 export function DeleteSession(arg1:string,arg2:string):Promise<void>;
+
+export function DeleteTeamPreset(arg1:string):Promise<void>;
 
 export function DetectInstallMethod():Promise<string>;
 
@@ -65,6 +71,8 @@ export function GetTabSessionID(arg1:string):Promise<string>;
 
 export function GetTabs():Promise<Array<models.TabState>>;
 
+export function GetTeamPresets():Promise<Array<models.TeamPreset>>;
+
 export function GetUsageInfo(arg1:string):Promise<models.UsageInfo>;
 
 export function GetWebSocketPort():Promise<number>;
@@ -87,15 +95,19 @@ export function RenameFile(arg1:string,arg2:string):Promise<void>;
 
 export function RenameTab(arg1:string,arg2:string):Promise<void>;
 
+export function RenameTeamPreset(arg1:string,arg2:string):Promise<void>;
+
 export function RequestCodeReview(arg1:string):Promise<void>;
 
-export function RequestContextRecommendation(arg1:string):Promise<void>;
+export function ResumeSessionInTerminal(arg1:string,arg2:string):Promise<void>;
 
 export function SaveDroppedFile(arg1:string,arg2:string):Promise<string>;
 
 export function SaveDroppedImage(arg1:string,arg2:string):Promise<string>;
 
 export function SaveFileContent(arg1:string,arg2:string):Promise<void>;
+
+export function SaveTeamPreset(arg1:string,arg2:string):Promise<void>;
 
 export function SearchFiles(arg1:string,arg2:string):Promise<Array<string>>;
 

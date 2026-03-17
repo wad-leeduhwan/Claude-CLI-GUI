@@ -16,6 +16,13 @@ function createOrchestratorStore() {
 
       switch (event.type) {
         case 'task-started':
+          // 같은 워커의 기존 running 태스크 완료 처리
+          for (const tid in tabState.tasks) {
+            if (tabState.tasks[tid].workerTabId === event.workerTabId &&
+                tabState.tasks[tid].status === 'running') {
+              tabState.tasks[tid] = { ...tabState.tasks[tid], status: 'completed' };
+            }
+          }
           tabState.tasks = {
             ...tabState.tasks,
             [event.taskId]: {
@@ -56,6 +63,17 @@ function createOrchestratorStore() {
           break;
 
         case 'job-completed':
+          const failed = event.status === 'failed';
+          const updatedTasks = { ...tabState.tasks };
+          for (const taskId in updatedTasks) {
+            if (updatedTasks[taskId].status === 'running') {
+              updatedTasks[taskId] = {
+                ...updatedTasks[taskId],
+                status: failed ? 'failed' : 'completed'
+              };
+            }
+          }
+          tabState.tasks = updatedTasks;
           tabState.jobComplete = true;
           break;
       }

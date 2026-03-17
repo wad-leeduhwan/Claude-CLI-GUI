@@ -17,8 +17,6 @@ type AgentTaskType string
 const (
 	AgentTaskTabRename      AgentTaskType = "tab-rename"
 	AgentTaskProjectSummary AgentTaskType = "project-summary"
-	AgentTaskClaudeMd       AgentTaskType = "claudemd-suggestion"
-	AgentTaskContextFiles   AgentTaskType = "context-files"
 	AgentTaskCodeReview     AgentTaskType = "code-review"
 )
 
@@ -130,10 +128,6 @@ func (as *AgentService) processTask(task AgentTask) {
 		result = as.handleTabRename(ctx, task)
 	case AgentTaskProjectSummary:
 		result = as.handleProjectSummary(ctx, task)
-	case AgentTaskClaudeMd:
-		result = as.handleClaudeMdSuggestion(ctx, task)
-	case AgentTaskContextFiles:
-		result = as.handleContextFiles(ctx, task)
 	case AgentTaskCodeReview:
 		result = as.handleCodeReview(ctx, task)
 	default:
@@ -234,89 +228,6 @@ Do NOT include any explanation or markdown. Keep the summary concise.`
 	var data map[string]interface{}
 	if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
 		result.Error = fmt.Errorf("failed to parse JSON: %w", err)
-		return result
-	}
-
-	result.Data = data
-	return result
-}
-
-func (as *AgentService) handleClaudeMdSuggestion(ctx context.Context, task AgentTask) AgentResult {
-	result := AgentResult{Type: task.Type, TabID: task.TabID, WorkDir: task.WorkDir}
-
-	systemPrompt := `You are a CLAUDE.md generator. Analyze the project and generate a CLAUDE.md file content.
-CLAUDE.md is a project instruction file that helps AI assistants understand the project context.
-Respond ONLY with a JSON object: {"content": "the full CLAUDE.md content"}
-The content should be under 50 lines and include:
-- Project description
-- Tech stack
-- Key conventions
-- Build/test commands
-Do NOT include any explanation outside the JSON.`
-
-	message := "Analyze this project and generate a CLAUDE.md file. Look at the project structure, config files, and codebase to understand conventions."
-
-	response, err := as.sendAgentMessage(ctx, fmt.Sprintf("claudemd-%d", time.Now().UnixMilli()), message, task.WorkDir, systemPrompt)
-	if err != nil {
-		result.Error = err
-		return result
-	}
-
-	jsonStr := extractJSON(response)
-	if jsonStr == "" {
-		result.Error = fmt.Errorf("no JSON found in response")
-		return result
-	}
-
-	var data map[string]interface{}
-	if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
-		result.Error = fmt.Errorf("failed to parse JSON: %w", err)
-		return result
-	}
-
-	if _, ok := data["content"].(string); !ok {
-		result.Error = fmt.Errorf("no 'content' field in response")
-		return result
-	}
-
-	result.Data = data
-	return result
-}
-
-func (as *AgentService) handleContextFiles(ctx context.Context, task AgentTask) AgentResult {
-	result := AgentResult{Type: task.Type, TabID: task.TabID, WorkDir: task.WorkDir}
-
-	systemPrompt := `You are a project context analyzer. Analyze the project and recommend 3-8 important files that would be useful as context for AI-assisted development.
-Respond ONLY with a JSON object: {"files": ["path/to/file1", "path/to/file2", ...]}
-Recommend files like:
-- Main entry points
-- Configuration files
-- Core type definitions
-- Important documentation
-Use relative paths from the project root. Do NOT include any explanation outside the JSON.`
-
-	message := "Analyze this project and recommend the most important files that should be included as context for understanding the project."
-
-	response, err := as.sendAgentMessage(ctx, fmt.Sprintf("context-files-%s-%d", task.TabID, time.Now().UnixMilli()), message, task.WorkDir, systemPrompt)
-	if err != nil {
-		result.Error = err
-		return result
-	}
-
-	jsonStr := extractJSON(response)
-	if jsonStr == "" {
-		result.Error = fmt.Errorf("no JSON found in response")
-		return result
-	}
-
-	var data map[string]interface{}
-	if err := json.Unmarshal([]byte(jsonStr), &data); err != nil {
-		result.Error = fmt.Errorf("failed to parse JSON: %w", err)
-		return result
-	}
-
-	if _, ok := data["files"]; !ok {
-		result.Error = fmt.Errorf("no 'files' field in response")
 		return result
 	}
 
